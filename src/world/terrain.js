@@ -11,7 +11,7 @@
 //   scatter: parsed scatter.json (trees, rocks, slideSpawns, guardrails, grassMask)
 import * as THREE from 'three';
 import { createTerrainMaterial, createWaterMaterial } from '../render/terrainMaterial.js';
-import { createRoadMaterial, createTunnelMaterial, tunnelLampPositions, TUNNEL, TUNNEL_SHARED } from '../render/roadMaterial.js';
+import { createRoadMaterial, createTunnelMaterial, tunnelLampPositions, TUNNEL, TUNNEL_SHARED, PORTAL } from '../render/roadMaterial.js';
 import { G, groups } from '../physics/world.js';
 
 const _v = new THREE.Vector3(), _d = new THREE.Vector3(0, -1, 0);
@@ -90,6 +90,10 @@ export default class Terrain {
     if (tunnelMesh && ctx.road) {
       try { const collar = this._portalCollar(tunnelMesh, matTunnel, root); if (collar) root.add(collar); }
       catch (e) { console.warn('[terrain] portal collar', e); }
+      try { const seal = this._portalRingSeal(matTunnel, root); if (seal) root.add(seal); }
+      catch (e) { console.warn('[terrain] portal ring seal', e); }
+      // the portal drainage channel needs ground heights (Rapier queries work after the first step): built in update()
+      this._chanPending = true; this._matTunnel = matTunnel;
     }
     const lampMesh = meshesOf(lamps)[0];
     if (lampMesh) {
@@ -827,6 +831,180 @@ export default class Terrain {
     return mesh;
   }
 
+  /**
+   * The headwall's arch ring meets the face along a line with T-junction cracks (terrain.glb): a dotted bright line
+   * traced along the top of the ring. A thin strip of headwall face, 1.5 cm proud of it, from just inside the ring's
+   * outer side (hidden in the ring) to 20 cm outside, covers it; the tunnel material shades it in world space, so it
+   * is continuous with the face. Returns a Mesh in root's space, or null.
+   */
+  _portalRingSeal(mat, root) {
+    const road = this.ctx.road;
+    if (!road) return null;
+    const s0 = TUNNEL.s0, SP = PORTAL.spring, W = PORTAL.ringIn, AH = PORTAL.archH, CC = PORTAL.collarC, CW = PORTAL.collar;
+    const c = road.pointAt(s0), l = road.leftAt(s0), t = road.tangentAt(s0); t.y = 0; t.normalize();
+    // the ring's outer edge exactly as terrain.py builds it: the opening (vertical legs d = +-4.9, then a half
+    // ellipse 4.9 x 5.3 over the springing line) pushed out 0.85 m radially from (0, 3.2), never below the opening
+    const opening = [];
+    for (let h = 0.15; h < SP; h += 0.35) opening.push([-W, h]);
+    for (let k = 0; k <= 64; k++) { const a = Math.PI - (Math.PI * k) / 64; opening.push([W * Math.cos(a), SP + AH * Math.sin(a)]); }
+    for (let h = SP - 0.35; h >= 0.15; h -= 0.35) opening.push([W, h]);
+    const path = opening.map(([d, h]) => {
+      const ox = d, oy = h - CC, ol = Math.hypot(ox, oy) || 1;
+      const cd = d + (ox / ol) * CW, ch = Math.max(h + (oy / ol) * CW, h);
+      const od = cd - d, oh = ch - h, n = Math.hypot(od, oh) || 1;
+      return [cd, ch, od / n, oh / n];
+    });
+    const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
+    const pos = [], nor = [], uv = [], masks = [], idx = [];
+    const w = new THREE.Vector3();
+    path.forEach(([d, h, od, oh], k) => {
+      for (const r of [-0.06, 0.2]) {
+        w.copy(c).addScaledVector(l, d + od * r).addScaledVector(t, PORTAL.front - 0.015);
+        w.y = c.y + h + oh * r;
+        w.applyMatrix4(inv);
+        pos.push(w.x, w.y, w.z); nor.push(-t.x, 0, -t.z); uv.push(k * 0.3, r); masks.push(0.85, 0.4, 0.1, 0);
+      }
+      if (k) { const a = (k - 1) * 2; idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3); }
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    geo.setAttribute('masks', new THREE.Float32BufferAttribute(masks, 4));
+    // wind toward the approaching road (-t)
+    const A = new THREE.Vector3(pos[0], pos[1], pos[2]), B = new THREE.Vector3(pos[6], pos[7], pos[8]), C = new THREE.Vector3(pos[3], pos[4], pos[5]);
+    const fn = B.sub(A).cross(C.sub(A)).transformDirection(root.matrixWorld);
+    if (fn.x * -t.x + fn.z * -t.z < 0) for (let i = 0; i < idx.length; i += 3) { const x = idx[i + 1]; idx[i + 1] = idx[i + 2]; idx[i + 2] = x; }
+    geo.setIndex(idx);
+    geo.computeBoundingSphere();
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.name = 'tunnel_portal_ring_seal';
+    mesh.receiveShadow = true; mesh.castShadow = false;
+    mesh.matrixAutoUpdate = false;
+    return mesh;
+  }
+
+  /**
+   * Portal drainage channel (REAL-WORLD MODEL: precast concrete U-channel, 0.30 m clear width, 0.20 m deep, 8 cm
+   * walls, set flush with the apron, carrying the headwall and wing-wall runoff back to the road ditch). Runs along
+   * the headwall foot on both sides of the ring and along both wing-wall bases to s ~1133, with a shallow film of
+   * running water in the bottom. One mesh in the tunnel material (masks: R = AO, G = 0.3 part id, B = water).
+   */
+  _buildPortalChannel() {
+    const { ctx } = this;
+    const road = ctx.road, phys = ctx.physics, mat = this._matTunnel;
+    if (!road || !mat) return;
+    const s0 = TUNNEL.s0, face = s0 + PORTAL.front;
+    const prw = (s) => THREE.MathUtils.clamp((s - 1131.0) / 18.5, 0, 1);
+    const wingD = (s, side) => (side > 0 ? 4.6 + 10.6 * prw(s) : 3.9 + 11.3 * prw(s)) - 0.75;   // wing face |d|
+    const P0 = road.pointAt(s0), L0 = road.leftAt(s0), T0 = road.tangentAt(s0); T0.y = 0; T0.normalize();
+    const runs = [];
+    for (const side of [1, -1]) {
+      const hw = [], dEnd = wingD(face, side) - 0.02;
+      for (let d = PORTAL.ringOut + 0.3; ; d += 0.5) {
+        const dd = Math.min(d, dEnd);
+        hw.push(P0.clone().addScaledVector(L0, side * dd).addScaledVector(T0, PORTAL.front - 0.26));
+        if (dd >= dEnd) break;
+      }
+      runs.push(hw);
+      const wr = [];
+      for (let s = face - 0.3; s >= 1133; s -= 0.5) wr.push(road.worldAt(s, side * (wingD(s, side) - 0.27)));
+      runs.push(wr);
+    }
+    const yRoad = P0.y;
+    const down = new THREE.Vector3(0, -1, 0), o = new THREE.Vector3();
+    const ground = (p) => {
+      const pr = road.project(p, {});
+      const top = road.pointAt(pr.s).y + 3.0;
+      const hit = phys?.world ? phys.raycast(o.set(p.x, top, p.z), down, 9, { groups: groups(G.ALL, G.STATIC) }) : null;
+      return hit ? hit.point.y : yRoad;
+    };
+    // cross-section (lateral offset, height below the rim top, AO, water)
+    const prof = [[-0.23, -0.22, 0.75], [-0.23, 0, 1.0], [-0.15, 0, 1.0], [-0.15, -0.2, 0.55], [0.15, -0.2, 0.5], [0.15, 0, 0.55], [0.23, 0, 1.0], [0.23, -0.22, 0.75]];
+    const pos = [], nor = [], uv = [], msk = [], idx = [];
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), n = new THREE.Vector3(), t = new THREE.Vector3(), lat = new THREE.Vector3();
+    for (const run of runs) {
+      if (run.length < 2) continue;
+      // the terrain is not cut: the channel stands 14 cm proud and its water surface lies 3 cm above the ground,
+      // so the apron never shows through inside the U
+      const ys = run.map((p) => ground(p) + 0.14);
+      // strips: each profile edge k -> k+1 (flat normals), then the water surface
+      const strips = [];
+      for (let k = 0; k < prof.length - 1; k++) strips.push([prof[k], prof[k + 1], 0]);
+      strips.push([[-0.15, -0.11, 1.0], [0.15, -0.11, 1.0], 1]);
+      let arc = 0;
+      const base0 = pos.length / 3;
+      for (let i = 0; i < run.length; i++) {
+        const p = run[i], pp = run[Math.max(0, i - 1)], pn = run[Math.min(run.length - 1, i + 1)];
+        t.subVectors(pn, pp); t.y = 0; t.normalize();
+        lat.set(-t.z, 0, t.x);
+        if (i) arc += p.distanceTo(run[i - 1]);
+        for (const [p0, p1, water] of strips) {
+          a.copy(p).addScaledVector(lat, p0[0]); a.y = ys[i] + p0[1];
+          b.copy(p).addScaledVector(lat, p1[0]); b.y = ys[i] + p1[1];
+          // the section is traversed outer-left -> over the rims and through the U -> outer-right, so the air side
+          // is always to the left of travel: n = (-dh, dl) in the (lateral, up) plane
+          const dl = p1[0] - p0[0], dh = p1[1] - p0[1];
+          n.copy(lat).multiplyScalar(-dh); n.y += dl;
+          if (water) n.set(0, 1, 0);
+          n.normalize();
+          for (const [q, pr] of [[a, p0], [b, p1]]) {
+            pos.push(q.x, q.y, q.z); nor.push(n.x, n.y, n.z); uv.push(arc, pr[0]);
+            // water: AO doubles as specular occlusion. In this walled cut the water mirrors the dark walls and rock,
+            // not the open sky that the IBL probe sees
+            msk.push(water ? 0.12 : pr[2], 0.3, water, 0);
+          }
+        }
+      }
+      const per = strips.length * 2;
+      for (let i = 0; i < run.length - 1; i++) {
+        for (let k = 0; k < strips.length; k++) {
+          const v0 = base0 + i * per + k * 2, v1 = v0 + 1, v2 = v0 + per, v3 = v2 + 1;
+          idx.push(v0, v2, v1, v1, v2, v3);
+        }
+      }
+      // end caps: the two wall sections (and the floor slab) of the U, facing out of each end of the run
+      for (const end of [0, run.length - 1]) {
+        const p = run[end], q = run[end ? end - 1 : 1];
+        t.subVectors(p, q); t.y = 0; t.normalize();          // outward along the run
+        // same lateral as the section at this end (built from the neighbour span, as above)
+        const lt = new THREE.Vector3().subVectors(run[Math.min(run.length - 1, end + 1)], run[Math.max(0, end - 1)]); lt.y = 0; lt.normalize();
+        lat.set(-lt.z, 0, lt.x);
+        for (const quad of [[[-0.23, -0.22], [-0.23, 0], [-0.15, 0], [-0.15, -0.22]], [[0.15, -0.22], [0.15, 0], [0.23, 0], [0.23, -0.22]], [[-0.15, -0.22], [-0.15, -0.2], [0.15, -0.2], [0.15, -0.22]]]) {
+          const b0 = pos.length / 3;
+          for (const [ol, oh] of quad) {
+            a.copy(p).addScaledVector(lat, ol); a.y = ys[end] + oh;
+            pos.push(a.x, a.y, a.z); nor.push(t.x, 0, t.z); uv.push(ol, oh); msk.push(0.8, 0.3, 0, 0);
+          }
+          idx.push(b0, b0 + 1, b0 + 2, b0, b0 + 2, b0 + 3);
+        }
+      }
+    }
+    if (!idx.length) return;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    geo.setAttribute('masks', new THREE.Float32BufferAttribute(msk, 4));
+    geo.setIndex(idx);
+    // wind every triangle so its face agrees with its vertex normal
+    const P = geo.attributes.position, N = geo.attributes.normal, ix = geo.index.array;
+    const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
+    for (let i = 0; i < ix.length; i += 3) {
+      a.fromBufferAttribute(P, ix[i]); e1.fromBufferAttribute(P, ix[i + 1]).sub(a); e2.fromBufferAttribute(P, ix[i + 2]).sub(a);
+      fn.crossVectors(e1, e2);
+      n.fromBufferAttribute(N, ix[i]);
+      if (fn.dot(n) < 0) { const x = ix[i + 1]; ix[i + 1] = ix[i + 2]; ix[i + 2] = x; }
+    }
+    geo.computeBoundingSphere();
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.name = 'tunnel_portal_channel';
+    mesh.receiveShadow = true; mesh.castShadow = false;
+    mesh.matrixAutoUpdate = false;
+    ctx.scene.add(mesh);
+    this.channel = mesh;
+  }
+
   /** 0 = outside, 1 = deep in the tunnel (daylight gone). */
   insideTunnel(pos) {
     const road = this.ctx.road;
@@ -925,6 +1103,10 @@ export default class Terrain {
     if (this._waterPending && this._stepped) {
       try { this._stepWater(4); } catch (e) { this._waterPending = false; console.warn('[terrain] water build failed', e); }
     }
+    if (this._chanPending && this._stepped) {
+      this._chanPending = false;
+      try { this._buildPortalChannel(); } catch (e) { console.warn('[terrain] portal channel', e); }
+    }
     this._updateRocks();
     // tunnel point lights follow the camera through the tunnel
     const cam = this.ctx.camera;
@@ -955,6 +1137,7 @@ export default class Terrain {
     if (this.rockRoot) this.ctx.scene.remove(this.rockRoot);
     if (this.deadwood) this.ctx.scene.remove(this.deadwood);
     if (this.water) this.ctx.scene.remove(this.water);
+    if (this.channel) this.ctx.scene.remove(this.channel);
     for (const L of this.tunnelLights || []) this.ctx.scene.remove(L);
   }
 }

@@ -6,7 +6,21 @@ import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.j
 
 // Base URL that works in dev and in a relative-path production build.
 export const BASE = import.meta.env.BASE_URL || './';
-export const url = (p) => (p.startsWith('http') || p.startsWith('data:') ? p : BASE + p.replace(/^\.?\//, ''));
+
+// Lighter asset variants for the MEDIUM ('mid') and LOW ('lo') presets (built by tools/make_variants.mjs).
+// Ultra/High never set a tier, so they always load the original full-quality files.
+let _variants = null, _tier = null;
+export function setVariantTier(manifest, tier) { _variants = manifest?.files || null; _tier = tier || null; }
+function variantOf(p) {
+  if (!_tier || !_variants) return p;
+  const m = /^assets\/(.+)$/.exec(p);
+  const v = m && _variants[m[1]]?.[_tier];
+  return v ? 'assets/' + v : p;
+}
+export const url = (p) => {
+  if (p.startsWith('http') || p.startsWith('data:') || p.startsWith('blob:')) return p;
+  return BASE + variantOf(p.replace(/^\.?\//, ''));
+};
 
 /**
  * Cached asset loading with a global progress counter (ctx.assets.progress).

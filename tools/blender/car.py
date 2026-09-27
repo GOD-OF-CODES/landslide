@@ -8,6 +8,8 @@ Options:
   --stage model   build geometry only and render quick previews with flat materials
   --stage full    (default) build, UV, bake textures, export GLB + car.json, render previews of the export (~5 min on an M1)
   --stage recompose  reopen scratch/car/car_final.blend, recompose the textures from the cached G-buffers, re-export
+  --stage lamps   (v5) reopen scratch/car/car_final.blend (pre-pass state) and only run the headlamp + wiper pass
+                  (lamp_wiper_pass: real H4 headlamps, wiper_l / wiper_r nodes), re-export (~1 min)
   --int-only      (with recompose) recompose only the interior textures (~45 s)
   --preview-only  re-render previews from the exported GLB
   --fast          1024 textures and low sample counts (for iteration)
@@ -1926,7 +1928,7 @@ def setup_render(samples=64, res=(1280, 720)):
     try: sc.view_settings.look = 'AgX - Base Contrast'
     except Exception: pass
     sc.render.film_transparent = False
-    sc.cycles.max_bounces = 8; sc.cycles.transmission_bounces = 8; sc.cycles.glossy_bounces = 4
+    sc.cycles.max_bounces = 10; sc.cycles.transmission_bounces = 8; sc.cycles.glossy_bounces = 8   # (v5) deep lamp bowls
     # world
     w = bpy.data.worlds.get('World') or bpy.data.worlds.new('World')
     sc.world = w; w.use_nodes = True
@@ -3692,8 +3694,20 @@ def recompose():
         if ob.type == 'MESH': remap_materials(ob, mats)
     for m in list(bpy.data.materials):
         if m.name.endswith('_old') and m.users == 0: bpy.data.materials.remove(m)
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(SCR, 'car_final.blend'))   # pre-pass state (see lamp_wiper_pass)
+    exp += lamp_wiper_pass()
     export_glb(exp)
-    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(SCR, 'car_final.blend'))
+
+def lamps_stage():
+    """--stage lamps: reopen the pre-pass car_final.blend, run the headlamp + wiper pass, re-export (no rebake)."""
+    bpy.ops.wm.open_mainfile(filepath=os.path.join(SCR, 'car_final.blend'))
+    for o in bpy.data.objects:
+        for nm in ('air_freshener', 'mirror_charm', 'key_ring'):
+            if o.type == 'EMPTY' and o.name.startswith(nm + '.'): o.name = nm
+    exp = [o for o in bpy.data.objects if o.get('export')]
+    exp += lamp_wiper_pass()
+    export_glb(exp)
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(SCR, 'car_lamps.blend'))     # post-pass state, for inspection only
 
 def texture_and_export(P):
     body, wheel = assemble(P)
@@ -3791,6 +3805,9 @@ def finalize_and_export(body, wheel, sw, needles, fresh=None, keyring=None):
     bpy.context.view_layer.update()
     exp = [root, body, swp, sw] + nps + nodes + list(empties.values())
     for o in exp: o['export'] = 1
+    # (v5) car_final.blend = the PRE-pass state, so recompose / --stage lamps always restart from it (idempotent)
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(SCR, 'car_final.blend'))
+    exp += lamp_wiper_pass()
     return export_glb(exp)
 
 def export_glb(exp):
@@ -3835,6 +3852,12 @@ def export_glb(exp):
         'rearMirror': rvm_frame(),
         'gaugeLens': {'center': [SEAT_L, 1.100, pod_f(1.100) - 0.012], 'tilt': round(math.degrees(GAUGE_TILT), 3), 'width': 0.345, 'height': 0.10,
                       '_note': 'clear cluster lens: a quad in the pod opening, normal toward the driver tilted by tilt deg (top leaning away)'},
+        'wipers': dict(WIPER_INFO, _note='wiper_l / wiper_r: pivot empties at the cowl spindles (identity rest rotation = parked), '
+                       'mesh child at identity. Sweep: node.quaternion.setFromAxisAngle(sweepAxis, angle), angle 0 (parked) .. '
+                       'sweepDeg*PI/180; positive angles lift the arm up the glass. Car-local three.js coords.'),
+        'headlamps': '7in H4 units: lens = material headlight (alpha glass, prism normal map, caustic-streak emissive map), '
+                     'reflector + bulb = material headlight_reflector (opaque, low-beam glow emissive map). Drive both with '
+                     'emissiveIntensity (prefix match on "headlight").',
         'emissive': 'headlight/brakelight/indicator/gauge materials carry an emissiveMap that holds the lit colour AND pattern (lamps: ext_emit bulb hotspot/reflector/lens optics; gauges: dial print); emissive factor is white. Drive emissiveIntensity only (0 = off).',
         'triangles': int(tris),
     }
@@ -3879,6 +3902,12 @@ def check_contract(path):
         if t is not None:
             tr = nd.get('translation', [0, 0, 0])
             if max(abs(a - c) for a, c in zip(tr, t)) > 1e-3: log('CONTRACT bad translation', k, tr, t); ok = False
+    for k in ('wiper_l', 'wiper_r'):
+        nd = byname.get(k)
+        if nd is None: log('CONTRACT MISSING node', k); ok = False; continue
+        want_t = WIPER_INFO.get(k, {}).get('pivot')
+        if want_t and max(abs(a - c) for a, c in zip(nd.get('translation', [0, 0, 0]), want_t)) > 1e-3:
+            log('CONTRACT bad translation', k, nd.get('translation'), want_t); ok = False
     mats = {m.get('name') for m in j.get('materials', [])}
     for m in ('paint', 'glass', 'chrome', 'trim_black', 'rubber', 'interior', 'headlight', 'brakelight', 'indicator', 'plate', 'gauge'):
         if m not in mats: log('CONTRACT missing material', m); ok = False
@@ -3922,6 +3951,28 @@ def preview_from_glb(path, prefix, views, samples):
                 nt.links.new(sp.outputs['Green'], gl.inputs['Roughness'])
             nt.links.new(fr.outputs[0], mx.inputs[0]); nt.links.new(trans_out, mx.inputs[1]); nt.links.new(gl.outputs[0], mx.inputs[2])
             nt.links.new(mx.outputs[0], out.inputs['Surface'])
+    # (v5) headlamp lens: ray-traced refraction through the prism normal map (Glass BSDF) for the preview, as ground
+    # truth for the engine's faked lens refraction (vehicle.js lensGlass); emission added when --lamps
+    for m in bpy.data.materials:
+        if m.name != 'headlight' or not m.use_nodes: continue
+        nt = m.node_tree
+        imgs = [nd.image for nd in nt.nodes if nd.type == 'TEX_IMAGE' and nd.image]
+        nrm_im = next((i for i in imgs if 'normal' in i.name), None); emi_im = next((i for i in imgs if 'emit' in i.name), None)
+        for nd in list(nt.nodes): nt.nodes.remove(nd)
+        out = nt.nodes.new('ShaderNodeOutputMaterial')
+        gl = nt.nodes.new('ShaderNodeBsdfGlass'); gl.inputs['IOR'].default_value = 1.5; gl.inputs['Roughness'].default_value = 0.01
+        gl.inputs['Color'].default_value = (0.95, 0.96, 0.95, 1)
+        if nrm_im is not None:
+            tn = nt.nodes.new('ShaderNodeTexImage'); tn.image = nrm_im; nrm_im.colorspace_settings.name = 'Non-Color'
+            nm = nt.nodes.new('ShaderNodeNormalMap'); nt.links.new(tn.outputs['Color'], nm.inputs['Color']); nt.links.new(nm.outputs['Normal'], gl.inputs['Normal'])
+        shader = gl.outputs[0]
+        if emi_im is not None and LAMPS_ON:
+            te = nt.nodes.new('ShaderNodeTexImage'); te.image = emi_im
+            em = nt.nodes.new('ShaderNodeEmission'); em.inputs['Strength'].default_value = 1.0
+            nt.links.new(te.outputs['Color'], em.inputs['Color'])
+            ad = nt.nodes.new('ShaderNodeAddShader'); nt.links.new(gl.outputs[0], ad.inputs[0]); nt.links.new(em.outputs[0], ad.inputs[1])
+            shader = ad.outputs[0]
+        nt.links.new(shader, out.inputs['Surface'])
     # (v4) interior ORM blue = material class for the engine's micro-detail shader, not metalness
     for m in bpy.data.materials:
         if m.name.startswith('interior') and m.use_nodes:
@@ -3931,10 +3982,376 @@ def preview_from_glb(path, prefix, views, samples):
                 b.inputs['Metallic'].default_value = 0.0
     if not LAMPS_ON:
         for m in bpy.data.materials:
-            if m.name in ('headlight', 'brakelight', 'indicator') and m.use_nodes:
+            if m.name.startswith(('headlight', 'brakelight', 'indicator')) and m.use_nodes:
                 b = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
                 if b: b.inputs['Emission Strength'].default_value = 0.0
     render_views(prefix, views, samples, (1280, 720))
+
+# ------------------------------------------------------------------------------------------------
+# (v5) HEADLAMPS + WIPERS pass. Runs on the finalized export hierarchy (full stage, recompose, --stage lamps), after
+# car_final.blend has been saved, so it is idempotent: every run starts from the pre-pass blend.
+#  - Headlamps: the old faceted-dome lens (it read as a uniform glossy sphere) and its reflector/bulb are removed from
+#    car_body_mesh and rebuilt as a real early-90s 7" H4 unit: a flat, slightly domed pressed-glass lens whose prism
+#    optics live in a dedicated 1024 normal map (vertical cylinder flutes, pillow lenslets, the 15 deg asymmetric
+#    kerb-side prisms, plain sealing flange, a few rain drops), a parabolic vacuum-metallised reflector (f = 26.5 mm)
+#    with the H4 bulb in its focus (clear envelope, black anti-glare tip, brass collar), behind the existing chrome ring.
+#    Materials: 'headlight' (lens: alpha glass) and 'headlight_reflector' (opaque metal; vehicle.js picks it up with the
+#    headlight prefix: emissiveIntensity + beam falloff). When lit, the reflector map carries the low-beam glow (upper
+#    half of the bowl: the H4 shield hides the lower half from the dipped filament) and the bulb; the lens map only
+#    the caustic streaks the flutes make of the filament image, so the bowl reads through the glass with parallax.
+#  - Wipers: the arm/pivot/blade parts are split out of car_body_mesh into 'wiper_l' / 'wiper_r' pivot empties (origin
+#    at the cowl spindle, identity rest rotation; mesh child at identity), parked. car.json 'wipers' gives the spindle
+#    axis (car-local three.js coords) with the sign that lifts the arm off its park position, and the sweep angle.
+# ------------------------------------------------------------------------------------------------
+LAMP_C = [(s * 0.565, F_FRONT - 0.004, 0.785) for s in (1, -1)]   # lamp centres (car coords), axis = +f
+LENS_R = 0.0885          # visible lens radius (tucks under the chrome ring's inner lip at r 0.087-0.093)
+LAMP_TR = 0.090          # half size of the lamp texture square (m)
+REFL_F = 0.0265          # reflector focal length (m)
+WIPER_INFO = {}
+LAMP_TEX = 1024
+
+def _lamp_uv(dl, dh):
+    return (0.5 + dl / (2 * LAMP_TR), 0.5 + dh / (2 * LAMP_TR))
+
+def _lamp_height_fields(N):
+    """Lens relief (m) + masks on an N x N grid over the lamp square. Row j <-> v, column i <-> u (Blender pixel order)."""
+    ax = (np.arange(N, dtype=np.float32) + 0.5) / N * 2 * LAMP_TR - LAMP_TR
+    X, Y = np.meshgrid(ax, ax)              # X = dl (car left = viewer's right), Y = dh
+    R = np.sqrt(X ** 2 + Y ** 2)
+    rng = np.random.RandomState(41)
+    fr = lambda a: a - np.floor(a)
+    # A: vertical cylinder flutes (spread the beam sideways), 7.5 mm pitch, convex, sharp valleys
+    P = 0.0075
+    cx = fr(X / P + 0.5 + 0.04 * np.sin(Y * 90.0))                   # flutes wander slightly (pressed glass)
+    hA = 0.0014 * (1 - (2 * cx - 1) ** 2)
+    lineA = np.exp(-((cx - 0.5) / 0.085) ** 2)
+    # B: pillow lenslets in the lower half (7.5 x 5.5 mm, rows offset)
+    Py = 0.0055
+    row = np.floor(Y / Py)
+    cxb = fr(X / P + 0.5 + 0.5 * (row % 2)); cyb = fr(Y / Py)
+    cell_b = np.floor(X / P + 0.5 + 0.5 * (row % 2)) * 7.13 + row * 3.71
+    jit = 0.85 + 0.3 * (np.sin(cell_b * 12.9898) * 43758.5453 % 1.0)        # per-lenslet pressing variation
+    hB = 0.0009 * jit * (1 - (2 * cxb - 1) ** 2) * (1 - (2 * cyb - 1) ** 2) ** 0.7
+    lineB = np.exp(-(((cxb - 0.5) / 0.12) ** 2 + ((cyb - 0.5) / 0.2) ** 2))
+    # C: fine 4 mm pillow grid in the centre (in front of the bulb)
+    cxc = fr(X / 0.004 + 0.5); cyc = fr(Y / 0.004 + 0.5)
+    hC = 0.0005 * (1 - (2 * cxc - 1) ** 2) * (1 - (2 * cyc - 1) ** 2)
+    lineC = np.exp(-(((cxc - 0.5) / 0.16) ** 2 + ((cyc - 0.5) / 0.16) ** 2))
+    # D: kerb-side 15 deg prisms (right-hand traffic: lower zone on the car's RIGHT = dl < 0), saw-tooth, 6 mm pitch
+    a15 = math.radians(15)
+    sD = (X * math.sin(a15) + Y * math.cos(a15))
+    cd = fr(sD / 0.006)
+    hD = 0.0011 * cd
+    lineD = np.exp(-((cd - 0.92) / 0.06) ** 2)
+    zB = sstep(-0.010, -0.014, Y) * (1 - sstep(0.058, 0.062, np.abs(X)))
+    zD = sstep(-0.006, -0.012, X) * sstep(-0.016, -0.022, Y) * (1 - sstep(0.068, 0.072, R))
+    zB = zB * (1 - zD)
+    zC = 1 - sstep(0.019, 0.021, R)
+    zA = (1 - zB) * (1 - zD) * (1 - zC)
+    zB *= (1 - zC); zD *= (1 - zC)
+    H = zA * hA + zB * hB + zC * hC + zD * hD
+    line = zA * lineA + zB * lineB + zC * lineC + zD * lineD
+    # plain sealing flange + rounded edge under the chrome ring; a small plain plate at the bottom (approval marks)
+    flange = sstep(0.0785, 0.0800, R)
+    plate = (np.abs(X) < 0.012) & (Y < -0.064) & (Y > -0.075)
+    H = H * (1 - flange); H[plate] = 0.0
+    line = line * (1 - flange); line[plate] = 0.0
+    H -= 0.0012 * sstep(0.0835, 0.0885, R) ** 2
+    # embossed marks on the plate: 'E1' / 'H4'-like bars (tiny raised strokes)
+    marks = plate & (np.abs(fr(X / 0.0024) - 0.5) < 0.18) & (np.abs(Y + 0.0695) < 0.0022)
+    H[marks] += 0.00012
+    # rain drops sitting on the glass (1-3 mm beads, a couple of runs), sparse
+    drops = np.zeros_like(H)
+    for k in range(34):
+        r0 = 0.0005 + rng.rand() ** 2 * 0.0013
+        a = rng.rand() * 2 * math.pi; rr = math.sqrt(rng.rand()) * 0.080
+        dx, dy = rr * math.cos(a), rr * math.sin(a)
+        el = 1.0 + (1.8 if k < 3 else 0.35) * rng.rand()          # a few elongated runs
+        d2 = ((X - dx) / r0) ** 2 + ((Y - dy) / (r0 * el)) ** 2
+        cap = np.sqrt(np.clip(1 - d2, 0, 1)) * r0 * 0.45
+        drops = np.maximum(drops, cap)
+    return X, Y, R, H, drops, line
+
+def lamp_textures():
+    """Lens (normal 1024, albedo/orm/emit 512) + reflector (albedo/orm/emit 512) PNGs in TEXDIR."""
+    N = LAMP_TEX
+    X, Y, R, H, drops, line = _lamp_height_fields(N)
+    inside = R <= LAMP_TR
+    Ht = H + drops
+    px = 2 * LAMP_TR / N
+    gy, gx = np.gradient(Ht, px)
+    n = np.stack([-gx, -gy, np.ones_like(Ht)], 2); n /= np.linalg.norm(n, axis=2, keepdims=True)
+    save_png((n * 0.5 + 0.5).astype(np.float32), os.path.join(TEXDIR, 'lamp_lens_normal.png'))
+    # 512 maps: downsample the fields 2x
+    def half(a): return a.reshape(N // 2, 2, N // 2, 2).mean((1, 3)) if a.ndim == 2 else a.reshape(N // 2, 2, N // 2, 2, a.shape[2]).mean((1, 3))
+    Xh, Yh, Rh, Hh, Dh, Lh = [half(a) for a in (X, Y, R, H, drops, line)]
+    P3 = np.stack([Xh * 20, Yh * 20, np.zeros_like(Xh)], 2).reshape(-1, 3).astype(np.float32)
+    nz1 = fbm(P3, (18, 18, 18), 3, 71).reshape(Xh.shape); nz2 = fbm(P3, (70, 70, 70), 2, 72).reshape(Xh.shape)
+    streak = 0.5 + 0.5 * fbm(np.stack([Xh * 20, Yh * 1.5, np.zeros_like(Xh)], 2).reshape(-1, 3).astype(np.float32), (40, 6, 6), 3, 73).reshape(Xh.shape)
+    # ---- lens: road-spray grime film on the lower part, grime in the flute valleys, rain-run streaks; drops are clean
+    valley = np.clip(1 - Hh / 0.0011, 0, 1) ** 2
+    low = sstep(0.0, -0.07, Yh)
+    dirt = np.clip(0.55 * low * (0.55 + 0.9 * nz1) + 0.25 * valley * (0.4 + low) + 0.18 * sstep(0.55, 0.8, streak) * (0.5 + low) - 0.05, 0, 1)
+    dirt *= (1 - sstep(0.0002, 0.0006, Dh))
+    alb = mixc(C(0.90, 0.92, 0.91), C(0.30, 0.25, 0.19), dirt[..., None] * 0.8)
+    rough = np.clip(0.025 + 0.5 * dirt ** 1.3 + 0.02 * nz2, 0.02, 1)
+    rough = np.where(Dh > 0.0002, 0.02, rough)
+    orm = np.stack([np.ones_like(rough), rough, np.zeros_like(rough)], 2)
+    save_png(alb.astype(np.float32), os.path.join(TEXDIR, 'lamp_lens_albedo.png'), srgb=True)
+    save_png(orm.astype(np.float32), os.path.join(TEXDIR, 'lamp_lens_orm.png'))
+    # ---- lit pattern. Reflector glow G: dipped beam lights the upper half of the bowl, hot spot around the bulb
+    th = np.arctan2(Yh, Xh)
+    upper = sstep(-0.35, 0.35, np.sin(th))
+    G = 0.95 * np.exp(-(Rh / 0.017) ** 2) + upper * (0.30 + 0.55 * np.exp(-(Rh / 0.045) ** 2)) + 0.05
+    G *= (1 - sstep(0.080, 0.087, Rh)) * (0.85 + 0.3 * nz1)
+    G = np.clip(G, 0, 1)
+    warm = C(1.0, 0.86, 0.66)
+    lens_emit = np.clip(G * (0.22 + 0.78 * Lh) * (1 - 0.6 * dirt), 0, 1)[..., None] * warm   # lens covers ~80 % of the bowl
+    lens_emit[Rh > LENS_R] = 0
+    save_png(lens_emit.astype(np.float32), os.path.join(TEXDIR, 'lamp_lens_emit.png'), srgb=True)
+    # ---- reflector: vacuum-metallised aluminium, heat haze ring round the bulb, fine dust; corner patches = bulb parts
+    haze = np.exp(-((Rh - 0.024) / 0.011) ** 2) * (0.6 + 0.4 * nz1)
+    ralb = mixc(C(0.91, 0.92, 0.93), C(0.62, 0.55, 0.44), (haze * 0.7)[..., None])
+    rrough = np.clip(0.05 + 0.22 * haze + 0.04 * nz2 + 0.05 * sstep(0.07, 0.087, Rh), 0.03, 1)
+    rmetal = np.ones_like(rrough)
+    rao = np.clip(1 - 0.25 * sstep(0.07, 0.088, Rh), 0, 1)
+    remit = (G * (1 - 0.3 * haze))[..., None] * warm
+    Nh = N // 2
+    U = (np.arange(Nh) + 0.5) / Nh
+    Uu, Vv = np.meshgrid(U, U)
+    def patch(u0, v0):
+        return (Uu > u0) & (Uu < u0 + 0.10) & (Vv > v0) & (Vv < v0 + 0.10)
+    glass, capm, collar = patch(0.02, 0.02), patch(0.88, 0.02), patch(0.02, 0.88)
+    ralb[glass] = (0.30, 0.30, 0.29); rrough[glass] = 0.04; rmetal[glass] = 0.0; rao[glass] = 1.0; remit[glass] = warm * 1.0
+    ralb[capm] = (0.018, 0.017, 0.016); rrough[capm] = 0.45; rmetal[capm] = 0.0; rao[capm] = 1.0; remit[capm] = 0.0
+    ralb[collar] = (0.62, 0.52, 0.34); rrough[collar] = 0.3; rmetal[collar] = 1.0; rao[collar] = 0.7; remit[collar] = warm * 0.06
+    save_png(ralb.astype(np.float32), os.path.join(TEXDIR, 'lamp_refl_albedo.png'), srgb=True)
+    save_png(np.stack([rao, rrough, rmetal], 2).astype(np.float32), os.path.join(TEXDIR, 'lamp_refl_orm.png'))
+    save_png(np.clip(remit, 0, 1).astype(np.float32), os.path.join(TEXDIR, 'lamp_refl_emit.png'), srgb=True)
+    return dict(glass=(0.02, 0.02), cap=(0.88, 0.02), collar=(0.02, 0.88))
+
+def build_headlamps(patches):
+    """Lens + reflector + bulb for both lamps -> one mesh object (2 materials). Car coords -> Blender via V()."""
+    T = lambda n: os.path.join(TEXDIR, n)
+    m_lens = export_material('headlight', albedo=T('lamp_lens_albedo.png'), orm=T('lamp_lens_orm.png'),
+                             normal=T('lamp_lens_normal.png'), rough=1.0, metal=1.0, emit=(1.0, 1.0, 1.0),
+                             emit_tex=T('lamp_lens_emit.png'), alpha=0.12, blend=True)
+    m_refl = export_material('headlight_reflector', albedo=T('lamp_refl_albedo.png'), orm=T('lamp_refl_orm.png'),
+                             rough=1.0, metal=1.0, emit=(1.0, 1.0, 1.0), emit_tex=T('lamp_refl_emit.png'))
+    bm = bmesh.new()
+    uvl = bm.loops.layers.uv.new('UVMap')
+    SEG = 64
+    def ring_pts(lc, fc, hc, r, x):
+        return [V(lc + r * math.cos(2 * math.pi * k / SEG), fc + x, hc + r * math.sin(2 * math.pi * k / SEG)) for k in range(SEG)]
+    def face(vs, uvs, mat):
+        try: f = bm.faces.new(vs)
+        except ValueError: return None
+        f.material_index = mat
+        for lp, uv in zip(f.loops, uvs): lp[uvl].uv = uv
+        f.smooth = True
+        return f
+    def disc_uv(k, r):
+        return _lamp_uv(r * math.cos(2 * math.pi * k / SEG), r * math.sin(2 * math.pi * k / SEG))
+    for lc, fc, hc in LAMP_C:
+        # ---- lens: shallow dome (7.5 mm crown), rim 3.5 mm behind the ring lip
+        rs = [LENS_R * (i / 10) ** 0.8 for i in range(11)]
+        xs = [-0.0035 + 0.0075 * (1 - (r / LENS_R) ** 2) for r in rs]
+        rings = [ring_pts(lc, fc, hc, r, x) for r, x in zip(rs, xs)]
+        vrings = [[bm.verts.new(p) for p in rg] for rg in rings[1:]]
+        cv = bm.verts.new(V(lc, fc + xs[0], hc))
+        for k in range(SEG):
+            k1 = (k + 1) % SEG
+            face([cv, vrings[0][k1], vrings[0][k]], [_lamp_uv(0, 0), disc_uv(k1, rs[1]), disc_uv(k, rs[1])], 0)
+            for i in range(len(vrings) - 1):
+                A, B = vrings[i], vrings[i + 1]
+                face([A[k], A[k1], B[k1], B[k]], [disc_uv(k, rs[i + 1]), disc_uv(k1, rs[i + 1]), disc_uv(k1, rs[i + 2]), disc_uv(k, rs[i + 2])], 0)
+        # ---- reflector: paraboloid x = -0.075 + r^2/4f, from the bulb hole to the lens rim
+        r_in = 0.0135
+        rr = [r_in + (0.0872 - r_in) * (i / 13) ** 1.15 for i in range(14)]
+        xr = [-0.075 + r * r / (4 * REFL_F) for r in rr]
+        rv = [[bm.verts.new(p) for p in ring_pts(lc, fc, hc, r, x)] for r, x in zip(rr, xr)]
+        for i in range(len(rv) - 1):
+            A, B = rv[i], rv[i + 1]
+            for k in range(SEG):
+                k1 = (k + 1) % SEG
+                # facing forward (toward the lens): winding B->A as seen from the front
+                face([A[k], B[k], B[k1], A[k1]], [disc_uv(k, rr[i]), disc_uv(k, rr[i + 1]), disc_uv(k1, rr[i + 1]), disc_uv(k1, rr[i])], 1)
+        # ---- H4 bulb: brass collar in the hole, clear envelope, black anti-glare tip
+        BS = 16
+        def lathe_part(prof, patch_uv):
+            u0, v0 = patch_uv
+            rgs = [[bm.verts.new(V(lc + r * math.cos(2 * math.pi * k / BS), fc + x, hc + r * math.sin(2 * math.pi * k / BS))) for k in range(BS)] for r, x in prof]
+            for i in range(len(prof) - 1):
+                for k in range(BS):
+                    k1 = (k + 1) % BS
+                    uvs = [(u0 + 0.1 * (k / BS) * 0.9 + 0.005, v0 + 0.1 * (i / len(prof)) * 0.9 + 0.005)] * 4
+                    face([rgs[i][k], rgs[i][k1], rgs[i + 1][k1], rgs[i + 1][k]], uvs, 1)
+            return rgs
+        lathe_part([(0.0136, -0.0742), (0.0125, -0.0690), (0.0100, -0.0680), (0.0072, -0.0672)], patches['collar'])
+        lathe_part([(0.0072, -0.0672), (0.0058, -0.0655), (0.0058, -0.0400), (0.0056, -0.0372)], patches['glass'])
+        tip = lathe_part([(0.0056, -0.0372), (0.0050, -0.0345), (0.0036, -0.0327), (0.0016, -0.0319)], patches['cap'])
+        c = bm.verts.new(V(lc, fc - 0.0317, hc))
+        u0, v0 = patches['cap']
+        for k in range(BS):
+            face([tip[-1][k], tip[-1][(k + 1) % BS], c], [(u0 + 0.05, v0 + 0.05)] * 3, 1)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+    # outward normals: lens + bulb face forward/outward, reflector faces forward (toward the lens)
+    for f in bm.faces:
+        cen = f.calc_center_median()
+        lc = LAMP_C[0][0] if cen.x > 0 else LAMP_C[1][0]
+        if f.material_index == 0:
+            if f.normal.y > 0: f.normal_flip()
+        else:
+            dx, dz = cen.x - lc, cen.z - 0.785
+            rad = math.hypot(dx, dz)
+            fwd_c = -cen.y - (F_FRONT - 0.004)
+            if rad > 0.0137 or fwd_c < -0.0745:     # reflector: normal toward the axis/front
+                want = Vector((-dx, -0.5 * rad, -dz)) if rad > 1e-6 else Vector((0, -1, 0))
+            else:                                        # bulb: normal away from the axis / forward at the tip
+                want = Vector((dx, -0.3 * rad - (1.0 if fwd_c > -0.034 else 0.0), dz))
+            if f.normal.dot(want) < 0: f.normal_flip()
+    me = bpy.data.meshes.new('headlamps_mesh'); bm.to_mesh(me); bm.free()
+    ob = bpy.data.objects.new('headlamps_mesh', me); coll('CAR').objects.link(ob)
+    me.materials.append(m_lens); me.materials.append(m_refl)
+    return ob
+
+def _dist_to_polyline(P, pts):
+    """P: (n,3) array; pts: list of Vectors. Minimum distance of each point to the polyline."""
+    best = np.full(len(P), 1e9, np.float32)
+    for a, b in zip(pts[:-1], pts[1:]):
+        a = np.array(a, np.float32); b = np.array(b, np.float32); ab = b - a
+        t = np.clip(((P - a) @ ab) / max(float(ab @ ab), 1e-12), 0, 1)
+        d = np.linalg.norm(P - (a + t[:, None] * ab), axis=1)
+        best = np.minimum(best, d)
+    return best
+
+def _wiper_geom(pl):
+    d_up = (ws_point(0, 1.5) - ws_point(0, 1.1)).normalized()
+    wn = d_up.cross(Vector((1, 0, 0))).normalized()
+    if wn.y > 0: wn = -wn
+    p0 = V(pl, 0.785, 1.072)
+    arm = [p0, ws_point(pl - 0.06, 1.118) + wn * 0.028, ws_point(pl - 0.44, 1.128) + wn * 0.022]
+    blade = [ws_point(pl - 0.03, 1.122) + wn * 0.010, ws_point(pl - 0.47, 1.128) + wn * 0.010]
+    edge = [ws_point(pl - 0.03, 1.122) + wn * 0.004, ws_point(pl - 0.47, 1.128) + wn * 0.004]
+    return p0, arm, blade, edge, wn, d_up
+
+def split_wipers(body, root):
+    """Separate the wiper parts (by distance to the paths that built them) into wiper_l / wiper_r pivot nodes."""
+    out = []
+    for side, pl in (('wiper_l', 0.34), ('wiper_r', -0.20)):
+        me = body.data                     # (re-read per wiper: separating the first one renumbers the vertices)
+        nv = len(me.vertices)
+        co = np.empty(nv * 3, np.float32); me.vertices.foreach_get('co', co); co = co.reshape(-1, 3)
+        # connected components (vertex union-find over edges)
+        ev = np.empty(len(me.edges) * 2, np.int64); me.edges.foreach_get('vertices', ev); ev = ev.reshape(-1, 2)
+        par = list(range(nv))
+        def find(i):
+            while par[i] != i:
+                par[i] = par[par[i]]; i = par[i]
+            return i
+        for a, b in ev.tolist():
+            ra, rb = find(a), find(b)
+            if ra != rb: par[ra] = rb
+        comp = np.array([find(i) for i in range(nv)])
+        p0, arm, blade, edge, wn, d_up = _wiper_geom(pl)
+        ok = (_dist_to_polyline(co, arm) <= 0.0055 + 0.0022) | (_dist_to_polyline(co, blade) <= 0.0045 + 0.0022) \
+            | (_dist_to_polyline(co, edge) <= 0.002 + 0.0022)
+        piv = np.array(V(pl, 0.785, 1.066), np.float32)
+        rad = np.hypot(co[:, 0] - piv[0], co[:, 1] - piv[1])
+        ok |= (rad <= 0.0165 + 0.002) & (np.abs(co[:, 2] - piv[2]) <= 0.0125)
+        # a component belongs to the wiper when ALL its vertices pass (cowl slots / cowl / glass fail)
+        bad = np.unique(comp[~ok])
+        sel_v = ok & ~np.isin(comp, bad)
+        comps = np.unique(comp[sel_v])
+        log(f'  {side}: {len(comps)} parts, {int(sel_v.sum())} verts')
+        if not sel_v.any(): continue
+        # select faces made only of selected verts, separate them
+        pv = np.empty(len(me.loops), np.int64); me.loops.foreach_get('vertex_index', pv)
+        for o in bpy.context.view_layer.objects: o.select_set(False)
+        bpy.context.view_layer.objects.active = body; body.select_set(True)
+        bpy.ops.object.mode_set(mode='EDIT'); bpy.ops.mesh.select_all(action='DESELECT'); bpy.ops.object.mode_set(mode='OBJECT')
+        for p in me.polygons:
+            p.select = bool(all(sel_v[me.loops[li].vertex_index] for li in p.loop_indices))
+        n_sel = sum(1 for p in me.polygons if p.select)
+        bpy.ops.object.mode_set(mode='EDIT'); bpy.ops.mesh.separate(type='SELECTED'); bpy.ops.object.mode_set(mode='OBJECT')
+        new = [o for o in bpy.context.selected_objects if o is not body]
+        if not new: log('  wiper separate failed', side); continue
+        w = new[0]
+        w.name = side + '_mesh'; w.data.name = side + '_mesh'
+        for o in bpy.context.view_layer.objects: o.select_set(False)
+        bpy.context.view_layer.objects.active = w; w.select_set(True)
+        with bpy.context.temp_override(object=w, active_object=w):
+            bpy.ops.object.material_slot_remove_unused()
+        # pivot empty at the spindle top (car_body space = car space), identity rotation; mesh child at identity
+        pivot = V(pl, 0.785, 1.072)
+        w.data.transform(Matrix.Translation(-pivot))
+        e = bpy.data.objects.new(side, None); e.empty_display_size = 0.05; coll('CAR').objects.link(e)
+        e.parent = root; e.matrix_parent_inverse = Matrix.Identity(4); e.matrix_basis = Matrix.Translation(pivot)
+        w.parent = e; w.matrix_parent_inverse = Matrix.Identity(4); w.matrix_basis = Matrix.Identity(4)
+        # sweep axis: A = d x u (d = parked arm direction, u = up the glass, orthogonalised) -> +angle lifts the arm
+        tipp = arm[-1]
+        d = (tipp - p0); d = (d - wn * d.dot(wn)).normalized()
+        u = (d_up - d * d.dot(d_up) - wn * wn.dot(d_up)).normalized()
+        A = d.cross(u).normalized()
+        b2t = lambda v: [round(v.x, 5), round(v.z, 5), round(-v.y, 5)]
+        WIPER_INFO[side] = {'pivot': b2t(pivot), 'sweepAxis': b2t(A), 'parkedDir': b2t(d), 'sweepDeg': 118 if side == 'wiper_l' else 112,
+                            'length': round((tipp - p0).length, 3), 'faces': n_sel}
+        out += [e, w]
+    return out
+
+def lamp_wiper_pass():
+    """(v5) See the section header. Returns the new objects to export."""
+    root = bpy.data.objects['car_body']; body = bpy.data.objects['car_body_mesh']
+    for nm in ('headlamps_mesh', 'wiper_l', 'wiper_r', 'wiper_l_mesh', 'wiper_r_mesh'):
+        if bpy.data.objects.get(nm): log('  lamp pass: already applied (', nm, ') - skipped'); return []
+    if bpy.context.object and bpy.context.object.mode != 'OBJECT': bpy.ops.object.mode_set(mode='OBJECT')
+    # ---- 1. remove the old lens (headlight faces) and reflector/bulb (chrome inside the ring) from car_body_mesh
+    me = body.data
+    mnames = [m.name if m else '' for m in me.materials]
+    bm = bmesh.new(); bm.from_mesh(me)
+    kill = []
+    fc = F_FRONT - 0.004
+    for f in bm.faces:
+        nm = mnames[f.material_index] if f.material_index < len(mnames) else ''
+        if nm.startswith('headlight'): kill.append(f); continue
+        if not nm.startswith('chrome'): continue
+        inside = True
+        for v in f.verts:
+            l, fw, h = v.co.x, -v.co.y, v.co.z
+            r = min(math.hypot(l - lc, h - hc) for lc, _, hc in LAMP_C)
+            if r > 0.0886 or fw < fc - 0.08 or fw > fc + 0.0015: inside = False; break
+        if inside: kill.append(f)
+    log(f'  lamp pass: removing {len(kill)} old lamp faces')
+    bmesh.ops.delete(bm, geom=kill, context='FACES')
+    bm.to_mesh(me); bm.free(); me.update()
+    for o in bpy.context.view_layer.objects: o.select_set(False)
+    bpy.context.view_layer.objects.active = body; body.select_set(True)
+    with bpy.context.temp_override(object=body, active_object=body):
+        bpy.ops.object.material_slot_remove_unused()
+    # ---- 1b. lamp pockets: the lower body's front wall (paint, f = 1.754) sits only 22 mm behind the lamp face, so the
+    # 75 mm deep reflector would be hidden behind it. Cut a cylindrical pocket (r 87.8 mm, back to f = 1.70) through the
+    # wall; the pocket walls take trim_black (lamp bucket), hidden behind the reflector anyway.
+    tb = bpy.data.materials.get('trim_black')
+    for lc, fcc, hc in LAMP_C:
+        cut = cyl('lampcut', (lc, 1.7325, hc), (0, 1, 0), 0.0878, 0.065, 48, None)
+        if tb: cut.data.materials.append(tb)
+        md = body.modifiers.new('lamp_pocket', 'BOOLEAN')
+        md.operation = 'DIFFERENCE'; md.solver = 'EXACT'; md.object = cut; md.material_mode = 'TRANSFER'
+        try: md.use_hole_tolerant = True
+        except Exception: pass
+        apply_mods(body)
+        delete_obj(cut)
+    log(f'  lamp pass: pockets cut, body polys {len(body.data.polygons)}')
+    # ---- 2. new lamps
+    patches = lamp_textures()
+    lamps = build_headlamps(patches)
+    lamps.parent = root; lamps.matrix_parent_inverse = Matrix.Identity(4); lamps.matrix_basis = Matrix.Identity(4)
+    for o in list(bpy.data.materials):
+        if o.name.startswith('headlight_old') and o.users == 0: bpy.data.materials.remove(o)
+    # ---- 3. wipers
+    new = [lamps] + split_wipers(body, root)
+    for o in new: o['export'] = 1
+    return new
 
 # ------------------------------------------------------------------------------------------------
 # Build
@@ -3994,6 +4411,12 @@ if __name__ == '__main__':
         if not NO_PREVIEW:
             preview_from_glb(OUT_GLB_RAW, 'p', VIEWS, 48 if FAST else 128)
         log('done')
+    elif STAGE == 'lamps':
+        lamps_stage()
+        optimize_glb()
+        if not NO_PREVIEW:
+            preview_from_glb(OUT_GLB_RAW, 'p', VIEWS, 48 if FAST else 128)
+        log('done')
     elif PREVIEW_ONLY:
         preview_from_glb(OUT_GLB_RAW, 'p', VIEWS, 48 if FAST else 128)
     elif STAGE == 'model':
@@ -4007,8 +4430,7 @@ if __name__ == '__main__':
     else:
         P = build_all()
         body, wheel, sw, fresh, keyring = texture_and_export(P)
-        finalize_and_export(body, wheel, sw, P['needles'], fresh, keyring)
-        bpy.ops.wm.save_as_mainfile(filepath=os.path.join(SCR, 'car_final.blend'))
+        finalize_and_export(body, wheel, sw, P['needles'], fresh, keyring)   # saves the pre-pass car_final.blend
         optimize_glb()
         if not NO_PREVIEW:
             preview_from_glb(OUT_GLB_RAW, 'p', VIEWS, 48 if FAST else 128)

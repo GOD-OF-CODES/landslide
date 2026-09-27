@@ -181,6 +181,50 @@
     "height": 0.1,
     "_note": "clear cluster lens: a quad in the pod opening, normal toward the driver tilted by tilt deg (top leaning away)"
   },
+  "wipers": {
+    "wiper_l": {
+      "pivot": [
+        0.34,
+        1.072,
+        0.785
+      ],
+      "sweepAxis": [
+        -0.0,
+        -0.62301,
+        -0.78222
+      ],
+      "parkedDir": [
+        -0.97776,
+        0.16407,
+        -0.13067
+      ],
+      "sweepDeg": 118,
+      "length": 0.45,
+      "faces": 64
+    },
+    "wiper_r": {
+      "pivot": [
+        -0.2,
+        1.072,
+        0.785
+      ],
+      "sweepAxis": [
+        -0.0,
+        -0.62301,
+        -0.78222
+      ],
+      "parkedDir": [
+        -0.97776,
+        0.16407,
+        -0.13067
+      ],
+      "sweepDeg": 112,
+      "length": 0.45,
+      "faces": 64
+    },
+    "_note": "wiper_l / wiper_r: pivot empties at the cowl spindles (identity rest rotation = parked), mesh child at identity. Sweep: node.quaternion.setFromAxisAngle(sweepAxis, angle), angle 0 (parked) .. sweepDeg*PI/180; positive angles lift the arm up the glass. Car-local three.js coords."
+  },
+  "headlamps": "7in H4 units: lens = material headlight (alpha glass, prism normal map, caustic-streak emissive map), reflector + bulb = material headlight_reflector (opaque, low-beam glow emissive map). Drive both with emissiveIntensity (prefix match on \"headlight\").",
   "emissive": "headlight/brakelight/indicator/gauge materials carry an emissiveMap that holds the lit colour AND pattern (lamps: ext_emit bulb hotspot/reflector/lens optics; gauges: dial print); emissive factor is white. Drive emissiveIntensity only (0 = off).",
-  "triangles": 144476
+  "triangles": 143387
 }

@@ -1,8 +1,9 @@
 import * as THREE from 'three';
-import { config } from './core/config.js';
+import { config, PARAMS, storedQuality } from './core/config.js';
 import { Events } from './core/events.js';
 import { Input } from './core/input.js';
-import { Assets } from './core/assets.js';
+import { Assets, setVariantTier, BASE } from './core/assets.js';
+import { showQualityGate } from './ui/gate.js';
 import { RoadPath } from './core/road.js';
 import { Debug, flags } from './core/debug.js';
 import Physics from './physics/world.js';
@@ -34,8 +35,41 @@ const SYSTEMS = [
 const UPDATE_ORDER = ['game', 'interact', 'car', 'player', 'landslide', 'particles', 'vegetation', 'props', 'terrain',
   'cameraRig', 'env', 'audio', 'hud', 'post'];
 
+// Every big asset the systems request, fetched up front in parallel. The keys match the systems' own calls
+// (same path + options), so they receive these shared promises instead of downloading one after another.
+function prefetch(assets) {
+  const P = [
+    assets.gltf('assets/world/terrain.glb'), assets.json('assets/world/scatter.json'),
+    assets.gltf('assets/models/trees.glb'), assets.gltf('assets/models/props.glb'),
+    assets.gltf('assets/models/rocks.glb'), assets.gltf('assets/models/car.glb'),
+    assets.json('assets/sky/sky.json'), assets.hdr('assets/sky/env_2k.hdr'),
+    ...['asphalt_02', 'concrete_wall_006', 'pine_bark', 'rough_wood', 'mud_forest', 'brown_mud_03',
+      'brown_mud_rocks_01', 'brown_mud_02'].map((n) => assets.pbr(n)),
+  ];
+  for (const p of P) p?.catch?.(() => {}); // failures surface in the owning system
+}
+
 async function boot() {
   const container = document.getElementById('app');
+
+  // 1) Quality first: it decides the renderer resolution and which asset variants get downloaded.
+  //    The pre-load screen is skipped for test/debug URLs and after a choice made earlier in this tab.
+  let gateDone = false;
+  try { gateDone = sessionStorage.getItem('landslide.gateDone') === '1'; } catch {}
+  if (!PARAMS.has('quality') && !flags.autostart && !flags.fixedCam && !gateDone) {
+    const key = await showQualityGate(storedQuality() ?? 'low');
+    config.setQuality(key);
+    try { sessionStorage.setItem('landslide.gateDone', '1'); } catch {}
+  }
+  if (config.quality.assetTier) {
+    try {
+      const manifest = await fetch(BASE + 'assets/q/variants.json').then((r) => (r.ok ? r.json() : null));
+      setVariantTier(manifest, config.quality.assetTier);
+    } catch (e) { console.warn('[boot] no asset variants, using full-quality files', e); }
+  }
+  // start fetching every system module now (dynamic imports are cached, init still runs in order below)
+  for (const [, loader] of SYSTEMS) loader().catch(() => {});
+
   const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false, depth: true });
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.NoToneMapping; // tone mapping happens in render/post.js
@@ -65,6 +99,7 @@ async function boot() {
   };
   ctx.physics.ctx = ctx;
   ctx.debug = new Debug(ctx);
+  if (!flags.only) prefetch(ctx.assets);
 
   // Core data first
   ctx.road = new RoadPath(await ctx.assets.json('assets/world/road.json'));
@@ -131,6 +166,27 @@ async function boot() {
     }
   };
 
+  // Adaptive resolution (medium/low only; ultra/high always render at their full preset resolution).
+  // Lowers the pixel ratio in 10% steps when the frame rate stays under ~40 fps, and restores it when there is headroom.
+  const baseRatio = renderer.getPixelRatio();
+  const ares = { on: !!config.quality.adaptiveRes && !flags.fixedCam, scale: 1, t: 0, n: 0, sum: 0 };
+  ctx.adaptiveRes = ares;
+  function adaptResolution(rawDt) {
+    if (!ares.on || ctx.paused || document.hidden) return;
+    ares.sum += rawDt; ares.n++; ares.t += rawDt;
+    if (ares.t < 2) return;
+    const avg = ares.sum / ares.n;
+    ares.t = ares.sum = ares.n = 0;
+    let next = ares.scale;
+    if (avg > 1 / 40) next = Math.max(0.55, ares.scale * 0.9);
+    else if (avg < 1 / 57) next = Math.min(1, ares.scale * 1.06);
+    if (Math.abs(next - ares.scale) > 0.005) {
+      ares.scale = next;
+      renderer.setPixelRatio(baseRatio * next);
+      onResize();
+    }
+  }
+
   let readyFrames = 0;
   function frame() {
     timer.update();
@@ -160,6 +216,7 @@ async function boot() {
     else renderer.render(scene, camera);
 
     ctx.debug.update(rawDt, renderer);
+    if (readyFrames > 60) adaptResolution(rawDt);
     ctx.input.endFrame();
     if (++readyFrames === 5) window.__READY = true; // headless tests wait for this
     requestAnimationFrame(frame);

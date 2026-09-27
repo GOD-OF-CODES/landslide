@@ -198,31 +198,34 @@ const ROCK_MUD_FRAG = /* glsl */`
     cav = 1.0 - texture2D( aoMap, vAoMapUv ).r;
   #endif
   float on = step( 0.02, vMud );
-  // the coat: blotchy, thickest on the buried side and in hollows, scraped off the fresh facets
-  float m = n1 * 0.45 + n2 * 0.3 + n3 * 0.2 + side * 0.55 + cav * 1.1 - fresh * 0.75 + ( rk_n( P * 31.0 + 1.7 ) - 0.5 ) * 0.22;
-  float thr = mix( 1.15, 0.05, vMud );
-  rkMudMask = smoothstep( thr - 0.05, thr + 0.08, m ) * on;
-  // soil packed into every crack and hollow, even on a lightly coated block
-  float cake = smoothstep( 0.28, 0.6, cav + ( n3 - 0.5 ) * 0.3 + ( n2 - 0.5 ) * 0.15 ) * ( 0.6 + 0.4 * vMud ) * on;
+  // the coat: thick blotches on the side that was buried, scraped off the fresh facets. Coverage grows with vMud from
+  // ~15 % (a block that fell clean out of the joint set) to ~85 % (one that rode in the soil), so bare wet rock always
+  // shows somewhere and keeps the block reading as stone
+  float m = n1 * 0.5 + n2 * 0.3 + n3 * 0.2 + side * 0.6 - fresh * 0.8 + ( rk_n( P * 31.0 + 1.7 ) - 0.5 ) * 0.2;
+  float thr = mix( 0.98, 0.12, vMud );
+  rkMudMask = smoothstep( thr - 0.03, thr + 0.05, m ) * on;
+  // fine soil packed into every crack, joint and hollow (baked AO: 82 % of the atlas is > 0.9, the creases 0.6-0.85)
+  float cake = smoothstep( 0.06, 0.2, cav + ( n3 - 0.5 ) * 0.06 ) * ( 0.8 + 0.2 * vMud ) * on;
   rkMudMask = max( rkMudMask, cake );
-  rkFilm = smoothstep( thr - 0.6, thr, m ) * on;
+  rkFilm = smoothstep( thr - 0.4, thr, m ) * on;
   rkDrain = rk_n( P * 3.3 + sd * 0.53 );
   rkW = pow( abs( rkNo ), vec3( 4.0 ) ); rkW /= dot( rkW, vec3( 1.0 ) );
   vec3 base = diffuseColor.rgb;
   float lum = dot( base, vec3( 0.2126, 0.7152, 0.0722 ) );
   vec3 rock = base * ( 1.0 - 0.3 * rkP.x );
   // fresh fracture: unweathered crystals, neutral grey, with the atlas's own grain kept as luminance variation
-  vec3 fr = vec3( lum * 1.75 ) * vec3( 0.96, 0.99, 1.03 ) * ( 1.0 - 0.3 * rkP.x ) * ( 0.9 + 0.2 * n3 );
+  vec3 fr = vec3( lum * 1.15 ) * vec3( 0.96, 0.99, 1.03 ) * ( 1.0 - 0.3 * rkP.x ) * ( 0.9 + 0.2 * n3 );
   rock = mix( rock, fr, fresh * 0.9 );
   rock = mix( rock, rock * vec3( 0.8, 0.69, 0.55 ), rkFilm * 0.75 * ( 1.0 - fresh * 0.7 ) );      // silt stain
   rkFresh = fresh;
   if ( rkMudMask > 0.002 ) {
     vec3 Q = P * rkP.y + sd * 0.173;
     vec3 mc = texture2D( rkMudMap, Q.zy ).rgb * rkW.x + texture2D( rkMudMap, Q.xz ).rgb * rkW.y + texture2D( rkMudMap, Q.xy ).rgb * rkW.z;
-    float ml = dot( mc, vec3( 0.3, 0.59, 0.11 ) );                        // no green seedlings: neutral wet earth
-    mc = mix( vec3( ml ), mc, 0.35 ) * vec3( 2.05, 1.75, 1.38 ) * ( 1.0 - 0.15 * rkP.x ) * ( 0.78 + 0.4 * n2 );
+    // brown_mud_03 (scan mean linear 0.089/0.070/0.046) graded to saturated dark-brown soil: ~0.05/0.037/0.025 wet
+    float ml = dot( mc, vec3( 0.3, 0.59, 0.11 ) );
+    mc = mix( vec3( ml ), mc, 0.8 ) * vec3( 0.95, 0.82, 0.74 ) * ( 1.0 - 0.42 * rkP.x ) * ( 0.85 + 0.3 * n2 );
     // caked soil in the hollows is darker still (finer, wetter)
-    mc *= 1.0 - 0.25 * smoothstep( 0.4, 0.8, cav );
+    mc *= 1.0 - 0.3 * smoothstep( 0.1, 0.3, cav );
     // fine roots torn out with the soil: a tangle of thin fibres (two warped stripe sets) inside the thick coat
     vec3 wp = P * 6.0 + ( rk_n( P * 2.3 + 4.0 ) * 2.6 - 1.3 ) * vec3( 1.0, -0.7, 0.45 ) + n3 * vec3( -0.6, 0.5, 0.9 );
     float f1 = abs( sin( dot( wp, vec3( 0.8, 0.35, -0.5 ) ) * 3.1 + sd ) );
@@ -237,12 +240,15 @@ const ROCK_MUD_FRAG = /* glsl */`
 const ROCK_ROUGH = /* glsl */`
 #include <roughnessmap_fragment>
 {
+  // atlas roughness ~0.55-0.75 dry; a rain film on crystalline rock drains in patches: 0.36-0.5 wet. Never below
+  // ~0.36 (a film on a micro-rough face is no mirror: no pale glossy highlight across the sky-facing faces)
   float r = roughnessFactor;
-  r = mix( r, r * mix( 0.6, 0.92, rkDrain ), rkP.x );                   // water film, draining in patches
-  r = clamp( r, 0.36, 0.85 );                                           // a film on micro-rough crystals: no mirror
+  r = mix( r, r * mix( 0.55, 0.8, rkDrain ), rkP.x );
+  r = clamp( r, 0.4, 0.85 );
   r = mix( r, 0.42, rkFilm * 0.4 );
-  r = mix( r, max( r, 0.46 ), rkFresh );                                // fresh fracture: crystal facets, dull
-  float mr = mix( 0.66, 0.38, smoothstep( 0.55, 0.85, rkDrain ) );      // earth clods matte, smeared mud glossy
+  r = mix( r, max( r, 0.5 ), rkFresh );                                 // fresh fracture: crystal facets, dull
+  // wet soil: matte clods ~0.6, smeared slurry ~0.36 (Lekner & Dorf: a saturated fine soil is a film over grit)
+  float mr = mix( 0.62, 0.38, smoothstep( 0.45, 0.8, rkDrain ) );
   roughnessFactor = mix( mix( r, mr, rkMudMask ), 0.6, rkRoot );
 }
 `;
@@ -292,7 +298,7 @@ function patchRockMaterial(mat, uniforms) {
   const prevKey = mat.customProgramCacheKey;
   mat.customProgramCacheKey = function () {
     const b = prevKey && prevKey !== THREE.Material.prototype.customProgramCacheKey ? prevKey.call(this) : '';
-    return b + '|rkmud3';
+    return b + '|rkmud4';
   };
   mat.needsUpdate = true;
   return mat;
@@ -440,14 +446,17 @@ export default class Landslide {
     const mat = baseMat.clone();
     if (mat.metalness === 0) mat.metalnessMap = null;   // dielectric: skip the extra ORM fetch
     // clinging forest earth (CC0 mud_forest); flat fallbacks keep the shader valid when it is missing
-    let soil = null;
+    let soil = null, coat = null;
     try { soil = await ctx.assets.pbr('mud_forest'); } catch { /* fallback below */ }
+    // the coat itself: brown_mud_03 (smeared wet clay with grit; shared with the debris front, so no extra memory).
+    // mud_forest's leaf litter read as white speckle on a tumbling block
+    try { coat = await ctx.assets.pbr('brown_mud_03'); } catch { coat = soil; }
     const flat = (r, g, b) => { const t = new THREE.DataTexture(new Uint8Array([r, g, b, 255]), 1, 1); t.needsUpdate = true; return t; };
     this._soil = soil;
     this.rockUniforms = {
-      rkMudMap: { value: soil?.map || flat(40, 26, 14) },
-      rkMudNor: { value: soil?.normalMap || flat(128, 128, 255) },
-      rkP: { value: new THREE.Vector4(ctx.env?.wetness ?? 0.75, 1 / 0.7, 0.3, 0) },
+      rkMudMap: { value: coat?.map || flat(40, 26, 14) },
+      rkMudNor: { value: coat?.normalMap || flat(128, 128, 255) },
+      rkP: { value: new THREE.Vector4(ctx.env?.wetness ?? 0.75, 1 / 1.1, 0.3, 0) },
       // exposure smear: 45 % of a 1/60 s dashcam exposure, capped at 0.3 m
       rkMB: { value: new THREE.Vector4(0.45 / 60, 0.3, 0, 0) },
     };
@@ -1841,9 +1850,9 @@ export default class Landslide {
     const chips = P?.chips, drops = P?.drops, dust = P?.dustSys;
     if (!chips && !drops) return;
     const cam = this.ctx.camera;
-    this._chipB = Math.min((this._chipB ?? 0) + dt * 40, 10);
-    this._dropB = Math.min((this._dropB ?? 0) + dt * 70, 16);
-    this._wispB = Math.min((this._wispB ?? 0) + dt * 6, 2);
+    this._chipB = Math.min((this._chipB ?? 0) + dt * 70, 14);
+    this._dropB = Math.min((this._dropB ?? 0) + dt * 90, 18);
+    this._wispB = Math.min((this._wispB ?? 0) + dt * 36, 4);
     if (!this.rocks.length) return;
     const fr = this._frustum || (this._frustum = new THREE.Frustum());
     fr.setFromProjectionMatrix(_m.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
@@ -1863,7 +1872,6 @@ export default class Landslide {
       const coat = (0.35 + R.mud) * Math.exp(-R.age / 7);
       const rate = coat * clamp(sp / 10, 0.4, 1.6) * (0.6 + R.r * 7) * (airborne ? 1 : 0.45);
       R._trAcc = (R._trAcc || 0) + dt * rate;
-      if (R._trAcc < 1) continue;
       // landing height below the rock (cached raycast; the road plane when that fails)
       if (!(R._gyT > R.age)) {
         R._gyT = R.age + 0.3;
@@ -1885,7 +1893,8 @@ export default class Landslide {
         if (chips && this._chipB >= 1) {
           this._chipB -= 1;
           const mud = rnd() < 0.72 ? 1 : 0;
-          const sc = mud ? 0.025 + rnd() * 0.05 * Math.min(R.r, 1.2) : 0.012 + Math.pow(rnd(), 2) * 0.035;
+          // clods of the coat 3-12 cm (visible at 10-40 m: ~1 px per 2-3 cm there), grit 1-5 cm
+          const sc = mud ? 0.03 + Math.pow(rnd(), 1.5) * 0.09 * Math.min(R.r, 1.2) : 0.012 + Math.pow(rnd(), 2) * 0.04;
           chips.emit(_p, _w, 2 + rnd() * 2, sc, mud, gy + sc * 0.3, (rnd() - 0.5) * 22);
         }
         if (drops && this._dropB >= 2) {
@@ -1897,15 +1906,21 @@ export default class Landslide {
           }
         }
       }
-      // a faint smear of wet fine soil / spray along the path of big, coated, airborne blocks
-      if (dust && airborne && R.r >= 0.45 && coat > 0.25 && this._wispB >= 1 && rnd() < dt * 6) {
-        this._wispB -= 1;
-        _w.set(v.x, v.y, v.z).multiplyScalar(0.3);
-        _p.copy(R.pos).addScaledVector(v, -0.04);
+      // the wake: a faint, continuous smear of wet fine soil and spray shed from the spinning rim of big airborne
+      // blocks (field footage: a thin brown-grey haze trailing a tumbling block for ~1 s, not a dry white plume).
+      // Albedo of saturated fine soil ~0.12, so it reads darker than the rain haze behind it.
+      R._wkAcc = (R._wkAcc || 0) + (airborne && R.r >= 0.4 && coat > 0.15 ? dt * (6 + 10 * Math.min(coat, 1)) * Math.min(sp / 8, 1.5) : 0);
+      while (dust && R._wkAcc >= 1 && this._wispB >= 1) {
+        R._wkAcc -= 1; this._wispB -= 1;
+        _u.set(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize();
+        _p.copy(R.pos).addScaledVector(_u, R.r * 0.6).addScaledVector(v, -0.03 - rnd() * 0.03);
+        _w.set(v.x, v.y, v.z).multiplyScalar(0.25 + rnd() * 0.15);
+        _w.addScaledVector(_u, 0.8);
         const t = rnd();
-        _col.setRGB(0.16 + t * 0.03, 0.14 + t * 0.03, 0.12 + t * 0.02);
-        dust.emit(_p, _w, 1.2 + rnd() * 0.8, R.r * 0.45, R.r * 1.6, 0.05 + rnd() * 0.04, _col, gy, 0.04, 1, 1, 2.8);
+        _col.setRGB(0.1 + t * 0.03, 0.085 + t * 0.025, 0.07 + t * 0.02);
+        dust.emit(_p, _w, 0.6 + rnd() * 0.5, R.r * 0.3, R.r * (0.9 + rnd() * 0.4), 0.16 + rnd() * 0.1, _col, gy, 0.03, 1, 1, 2.6);
       }
+      if (R._wkAcc > 3) R._wkAcc = 3;
     }
   }
 
@@ -1957,11 +1972,12 @@ export default class Landslide {
     const meshes = this.liveMeshes;
     if (!meshes) return;
     const cam = this.ctx.camera.position;
-    const loV = this.loVar || [];
+    const L = this.lodCfg || (this.lodCfg = { live: LIVE_FULL, small: LIVE_FULL_SMALL, debris: DEBRIS_FULL, lod1: true });
+    const loV = L.lod1 ? (this.loVar || []) : [];
     for (const m of meshes) instReset(m);
-    for (const m of loV) if (m) instReset(m);
+    for (const m of this.loVar || []) if (m) instReset(m);
     const cv = this._camVel;
-    const lf2 = LIVE_FULL * LIVE_FULL, lfs2 = LIVE_FULL_SMALL * LIVE_FULL_SMALL;
+    const lf2 = L.live * L.live, lfs2 = L.small * L.small;
     for (const R of this.rocks) {
       const im = meshes[R.variant];
       _m.compose(R.pos, R.quat, _s.set(R.r, R.r, R.r));
@@ -1977,7 +1993,7 @@ export default class Landslide {
     }
     for (const m of meshes) instFinish(m);
     for (const m of this.debrisMeshes) instReset(m);
-    const df2 = DEBRIS_FULL * DEBRIS_FULL;
+    const df2 = L.debris * L.debris;
     for (const D of this.debris) {
       const im = this.debrisMeshes[D.variant];
       if (!im) continue;
@@ -1989,7 +2005,7 @@ export default class Landslide {
       instPush(im, D.matrix, D.mudP);
     }
     for (const m of this.debrisMeshes) instFinish(m);
-    for (const m of loV) if (m) instFinish(m);
+    for (const m of this.loVar || []) if (m) instFinish(m);
     if (this.loMesh) instFinish(this.loMesh);
     // debris swallowed by the advancing front disappears into it
     if (this.frontS > 0 && this.debris.length && this.ctx.road) {

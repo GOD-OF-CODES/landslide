@@ -362,7 +362,7 @@ class HistoryPass extends Pass {
 const MIST_VERT = 'varying vec2 vUv; void main(){ vUv = position.xy * 0.5 + 0.5; gl_Position = vec4(position.xy, 1.0, 1.0); }';
 const MIST_MARCH = /* glsl */`
 precision highp sampler3D;
-uniform sampler2D tDepth; uniform sampler3D tNoise;
+uniform sampler2D tDepth; uniform sampler3D tNoise; uniform sampler2D tBlue;
 uniform mat4 projInv; uniform mat4 camWorld; uniform vec3 camPos;
 uniform vec4 mPlane;    // x road-plane y at the camera, y slope (dy/dm along zw), zw unit xz direction of the road
 uniform vec4 mGround;   // x density, y height, z near start, w far end
@@ -416,7 +416,11 @@ void main() {
   float D = z >= 0.9999999 ? 1e5 : length(vv);
   vec3 rd = normalize((camWorld * vec4(vv, 0.0)).xyz);
   vec3 ro = camPos;
-  float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  // (DITHER fix) per-texel march offset from a tiled void-and-cluster blue-noise mask. The former interleaved-gradient
+  // noise is a rank-1 lattice: under the upsample it printed a regular diamond / screen-door grid over every misty
+  // tree line (docs screenshot 01). Blue noise has no low-frequency or periodic energy, so the upsample filter removes
+  // it completely; it is static (temporally stable, no crawl while the camera is still).
+  float jit = texelFetch(tBlue, ivec2(gl_FragCoord.xy) & 63, 0).r;
   float S = 0.0, T = 1.0;
   // ground wisps: height above the road plane h(t) = h0 + k t
   if (mGround.x > 0.0 && mGround2.z > 0.0) {
@@ -497,13 +501,14 @@ class MistPass extends Pass {
     this.needsDepthTexture = true;
     this.scale = scale;
     this.noise = createMistNoise3D(64);
+    this.blue = createBlueNoise(64);
     this.rt = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType, depthBuffer: false, stencilBuffer: false });
     this.rt.texture.minFilter = this.rt.texture.magFilter = THREE.NearestFilter;
     this.rt.texture.generateMipmaps = false;
     this.rt.texture.name = 'post.mist';
     const V4 = () => new THREE.Vector4();
     this.u = {
-      tDepth: { value: null }, tNoise: { value: this.noise },
+      tDepth: { value: null }, tNoise: { value: this.noise }, tBlue: { value: this.blue },
       projInv: { value: new THREE.Matrix4() }, camWorld: { value: new THREE.Matrix4() }, camPos: { value: new THREE.Vector3() },
       mPlane: { value: V4() }, mGround: { value: V4() }, mGround2: { value: V4() }, mValley: { value: V4() }, mBand: { value: V4() }, mBand2: { value: V4() },
       mNoise: { value: V4() }, mLight: { value: V4() }, mSun: { value: new THREE.Vector3(0, 1, 0) },
@@ -558,7 +563,53 @@ class MistPass extends Pass {
     if (env?.sunDirection) u.mSun.value.copy(env.sunDirection);
     if (scene.fog?.color) this.cu.mistCol.value.copy(scene.fog.color);
   }
-  dispose() { super.dispose(); this.rt.dispose(); this.noise.dispose(); this.march.dispose(); this.composite.dispose(); }
+  dispose() { super.dispose(); this.rt.dispose(); this.noise.dispose(); this.blue.dispose(); this.march.dispose(); this.composite.dispose(); }
+}
+
+/**
+ * N x N tiling blue-noise threshold mask (void-and-cluster, Ulichney 1993), deterministic (seeded), R8 texture with
+ * values rank / N^2. ~20 ms for 64 x 64 at init. Used as the per-pixel jitter of the ray-marched mist.
+ */
+function createBlueNoise(N = 64) {
+  const n = N * N, SIG = 1.9, R = 7;
+  const K = new Float32Array((2 * R + 1) * (2 * R + 1));
+  for (let j = -R; j <= R; j++) for (let i = -R; i <= R; i++) K[(j + R) * (2 * R + 1) + i + R] = Math.exp(-(i * i + j * j) / (2 * SIG * SIG));
+  const E = new Float32Array(n), bits = new Uint8Array(n);
+  const splat = (p, s) => {
+    const x = p % N, y = (p / N) | 0;
+    for (let j = -R; j <= R; j++) {
+      const yy = ((y + j + N) % N) * N;
+      for (let i = -R; i <= R; i++) E[yy + ((x + i + N) % N)] += s * K[(j + R) * (2 * R + 1) + i + R];
+    }
+  };
+  const tightest = () => { let b = -1, v = -Infinity; for (let p = 0; p < n; p++) if (bits[p] && E[p] > v) { v = E[p]; b = p; } return b; };
+  const loosest = () => { let b = -1, v = Infinity; for (let p = 0; p < n; p++) if (!bits[p] && E[p] < v) { v = E[p]; b = p; } return b; };
+  let seed = 0x9e3779b9;
+  const rnd = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  // initial pattern: 10 % random points, relaxed until the tightest cluster is also the largest void
+  const ones = Math.round(n * 0.1);
+  for (let k = 0; k < ones;) { const p = Math.floor(rnd() * n); if (!bits[p]) { bits[p] = 1; splat(p, 1); k++; } }
+  for (let it = 0; it < n; it++) {
+    const c = tightest(); bits[c] = 0; splat(c, -1);
+    const v = loosest();
+    bits[v] = 1; splat(v, 1);
+    if (v === c) break;
+  }
+  const proto = bits.slice(), protoE = E.slice(), rank = new Uint32Array(n);
+  // phase 1: rank the prototype's points by repeatedly removing the tightest cluster
+  for (let k = ones - 1; k >= 0; k--) { const c = tightest(); bits[c] = 0; splat(c, -1); rank[c] = k; }
+  // phases 2 + 3: from the prototype, fill the largest void until every texel has a rank
+  bits.set(proto); E.set(protoE);
+  for (let k = ones; k < n; k++) { const v = loosest(); bits[v] = 1; splat(v, 1); rank[v] = k; }
+  const data = new Uint8Array(n);
+  for (let p = 0; p < n; p++) data[p] = Math.min(255, Math.floor((rank[p] + 0.5) / n * 256));
+  const t = new THREE.DataTexture(data, N, N, THREE.RedFormat, THREE.UnsignedByteType);
+  t.minFilter = t.magFilter = THREE.NearestFilter;
+  t.generateMipmaps = false;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.name = 'post.blueNoise';
+  t.needsUpdate = true;
+  return t;
 }
 // mist march resolution per quality key (null = off)
 const MIST_SCALE = { ultra: 0.5, high: 0.42, medium: 0.33, low: null };

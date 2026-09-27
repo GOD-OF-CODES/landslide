@@ -1,11 +1,14 @@
 // Central configuration: quality presets + gameplay tuning.
-// Quality is chosen via ?quality=ultra|high|medium|low (default 'high'), or the title-screen menu (stored in localStorage).
+// Quality is chosen on the pre-load quality screen (src/ui/gate.js), via ?quality=ultra|high|medium|low, or the
+// title-screen menu; stored in localStorage. Default is 'low' so any machine can start. Ultra/High load the original
+// full-quality assets; medium/low load the lighter variants from tools/make_variants.mjs (assetTier).
 
 export const QUALITY_PRESETS = {
   ultra: {
     name: 'Ultra', pixelRatio: 1.0, maxDpr: 2, shadowMapSize: 4096, shadowRadius: 70,
     ao: 'high', bloom: true, motionBlur: true, dof: true, grassDensity: 1.0, grassRadius: 70,
     treeMeshDistance: 110, impostorDistance: 2200, rain: 1.0, maxRocks: 90, anisotropy: 16,
+    assetTier: null, adaptiveRes: false, download: 90,
   },
   // High renders at CSS-pixel resolution (maxDpr 1): at DPR 1.5 on the target M1's Retina display the frame is
   // 2.25x the pixels and the game ran at 26-35 fps in a 1280x720 window. Ultra is the Retina-native preset.
@@ -17,24 +20,30 @@ export const QUALITY_PRESETS = {
     name: 'High', pixelRatio: 1.0, maxDpr: 1.0, shadowMapSize: 4096, sunShadowMapSize: 2048, shadowRadius: 60,
     ao: 'medium', bloom: true, motionBlur: false, dof: true, grassDensity: 0.75, grassRadius: 55,
     treeMeshDistance: 80, impostorDistance: 1800, rain: 0.8, maxRocks: 70, anisotropy: 8,
+    assetTier: null, adaptiveRes: false, download: 90,
   },
   medium: {
     name: 'Medium', pixelRatio: 0.8, maxDpr: 1, shadowMapSize: 2048, shadowRadius: 50,
     ao: 'low', bloom: true, motionBlur: false, dof: false, grassDensity: 0.45, grassRadius: 40,
     treeMeshDistance: 55, impostorDistance: 1400, rain: 0.6, maxRocks: 50, anisotropy: 4,
+    assetTier: 'mid', adaptiveRes: true, download: 39,
   },
   low: {
     name: 'Low', pixelRatio: 0.65, maxDpr: 1, shadowMapSize: 1024, shadowRadius: 40,
     ao: 'off', bloom: false, motionBlur: false, dof: false, grassDensity: 0.2, grassRadius: 28,
     treeMeshDistance: 35, impostorDistance: 1000, rain: 0.4, maxRocks: 30, anisotropy: 2,
+    assetTier: 'lo', adaptiveRes: true, download: 26,
   },
 };
 
 export const PARAMS = new URLSearchParams(location.search);
 
+export function storedQuality() {
+  try { const q = localStorage.getItem('landslide.quality'); return QUALITY_PRESETS[q] ? q : null; } catch { return null; }
+}
 function pickQuality() {
-  const q = PARAMS.get('quality') || (() => { try { return localStorage.getItem('landslide.quality'); } catch { return null; } })();
-  return QUALITY_PRESETS[q] ? q : 'high';
+  const q = PARAMS.get('quality') || storedQuality();
+  return QUALITY_PRESETS[q] ? q : 'low';
 }
 
 export const config = {

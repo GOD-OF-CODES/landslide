@@ -339,7 +339,7 @@ export default class Vehicle {
    * 1 within ~15 deg of the axis, ~0.12 beyond ~40 deg.
    */
   _setupBeamFalloff() {
-    this._hlFwd = { value: new THREE.Vector3(0, 0, 1) };
+    this._hlFwd ||= { value: new THREE.Vector3(0, 0, 1) };
     for (const m of this.mats.headlight || []) {
       const prev = m.onBeforeCompile, prevKey = m.customProgramCacheKey;
       m.onBeforeCompile = (sh, r) => {
@@ -360,6 +360,44 @@ export default class Vehicle {
     }
   }
 
+  /**
+   * (v5) The H4 reflector bowl (material headlight_reflector, opaque metal) behind the clear lens. Single-bounce IBL makes
+   * the upper half of a deep concave mirror reflect the dark road (the reflected ray points down), so the bowl read as a
+   * dark hole. A closed paraboloid sends those rays through the focus onto the far side of the bowl and back out
+   * (2 bounces, ~0.91^2 energy): it mirrors the sky / horizon behind the viewer from almost every angle, which is why
+   * real reflector lamps look silvery in daylight. The reflected direction is folded into the upper hemisphere.
+   */
+  _setupReflector() {
+    const chunk = THREE.ShaderChunk.lights_fragment_maps;
+    const call = 'vec3 iblRadiance = getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );';
+    if (!chunk.includes(call)) return;
+    for (const m of this.mats.headlight || []) {
+      if (m.transparent) continue;
+      const prev = m.onBeforeCompile, prevKey = m.customProgramCacheKey;
+      m.onBeforeCompile = (sh, r) => {
+        if (prev && prev !== THREE.Material.prototype.onBeforeCompile) prev.call(m, sh, r);
+        sh.fragmentShader = sh.fragmentShader
+          .replace('#include <envmap_physical_pars_fragment>', `#include <envmap_physical_pars_fragment>
+          vec3 hlReflIBL( const in vec3 viewDir, const in vec3 normal, const in float roughness ) {
+            #ifdef ENVMAP_TYPE_CUBE_UV
+              vec3 rv = reflect( - viewDir, normal );
+              rv = normalize( mix( rv, normal, pow4( roughness ) ) );
+              rv = transformDirectionByInverseViewMatrix( rv, viewMatrix );
+              float dn = smoothstep( 0.05, -0.25, rv.y );
+              rv.y = abs( rv.y ) * 0.75 + 0.1; rv = normalize( rv );
+              return textureCubeUV( envMap, envMapRotation * rv, roughness ).rgb * envMapIntensity * 0.7 * ( 1.0 - 0.55 * dn );
+            #else
+              return vec3( 0.0 );
+            #endif
+          }`)
+          .replace('#include <lights_fragment_maps>', chunk.replace(call, 'vec3 iblRadiance = hlReflIBL( geometryViewDir, geometryNormal, material.roughness );'));
+      };
+      const base = prevKey && prevKey !== THREE.Material.prototype.customProgramCacheKey ? prevKey.call(m) : '';
+      m.customProgramCacheKey = () => base + '|hlrefl';
+      m.needsUpdate = true;
+    }
+  }
+
   _setupRenderCost(root) {
     this.interiorMeshes = [];
     root.traverse((o) => {
@@ -373,7 +411,9 @@ export default class Vehicle {
     });
     const U = this._cabinUniforms();
     for (const m of this.mats.glass || []) alphaGlass(m, false, false, U);
-    for (const m of this.mats.headlight || []) if (m.transparent) alphaGlass(m, true); // clear lens: facets reflect at full strength
+    this._hlFwd = { value: new THREE.Vector3(0, 0, 1) }; this._hlLeft = { value: new THREE.Vector3(1, 0, 0) }; this._hlUp = { value: new THREE.Vector3(0, 1, 0) };
+    for (const m of this.mats.headlight || []) if (m.transparent) lensGlass(m, this); // (v5) fluted H4 lens: faked refraction
+    try { this._setupReflector(); } catch (e) { console.warn('[car] headlamp reflector', e); }
     try { this._setupBeamFalloff(); } catch (e) { console.warn('[car] headlight beam falloff', e); }
     try { this._setupLens(); } catch (e) { console.warn('[car] gauge lens', e); }
     this._setupCabinFill();
@@ -1136,8 +1176,13 @@ export default class Vehicle {
       this._lastEmis[key] = intensity;
       for (const m of M[key] || []) m.emissiveIntensity = intensity;
     };
-    set('headlight', head ? 2.1 * dim : 0); // lens emission is not scaled by the 0.12 alpha (alphaGlass)
-    if (this._hlFwd && this.object) this._hlFwd.value.set(0, 0, 1).applyQuaternion(this.object.getWorldQuaternion(_hlQ));
+    set('headlight', head ? 3.0 * dim : 0); // (v5) lens + reflector maps carry the lit pattern; off-axis x0.12 (beam falloff)
+    if (this._hlFwd && this.object) {
+      this.object.getWorldQuaternion(_hlQ);
+      this._hlFwd.value.set(0, 0, 1).applyQuaternion(_hlQ);
+      this._hlLeft?.value.set(1, 0, 0).applyQuaternion(_hlQ);
+      this._hlUp?.value.set(0, 1, 0).applyQuaternion(_hlQ);
+    }
     set('brakelight', (braking ? 5.5 : 0) + (head ? 0.9 : 0));
     set('indicator', blink ? 5 : 0);
     set('gauge', ign ? 0.9 * dim : 0);
@@ -1337,6 +1382,84 @@ function alphaGlass(m, emissive = false, lens = false, U = null) {
   m.needsUpdate = true;
 }
 
+/**
+ * (v5) Headlamp lens (material 'headlight', alpha glass with the prism normal map). On a transparent material a normal
+ * map only changes the ~4-5 % Fresnel reflection, so the flutes vanished in front of the bright reflector. Real pressed
+ * lenses show their optics by REFRACTION: every flute is a cylinder lens that shows a squeezed, inverted strip of the
+ * silvered bowl, so the lamp reads as bright/dark vertical bands that slide with the view angle. Faked per pixel:
+ * the view ray is refracted through the flute normal (n 1.5) and the flat back face, marched to the paraboloid behind
+ * (f 26.5 mm, lens-local position from the planar UV) and reflected off it into the sky (folded into the upper
+ * hemisphere, see _setupReflector), with the H4 bulb envelope / black tip found where the refracted ray crosses them
+ * (parallax). The lens draws uLensCover of the interior this way; the real reflector + bulb geometry shows through
+ * the rest (and carries its own lit glow). Specular reflection, dirt film and emission as in alphaGlass.
+ */
+function lensGlass(m, veh) {
+  if (m.userData.glassPatched) return;
+  m.userData.glassPatched = true;
+  m.depthWrite = false; m.premultipliedAlpha = false;
+  const U = { uGlassDirt: { value: 0.5 }, uLensCover: { value: 0.82 }, uLensFwd: veh._hlFwd, uLensLeft: veh._hlLeft, uLensUp: veh._hlUp };
+  m.userData.glassDirt = U.uGlassDirt; m.userData.lensCover = U.uLensCover;
+  const prev = m.onBeforeCompile;
+  m.onBeforeCompile = (sh, r) => {
+    if (prev && prev !== THREE.Material.prototype.onBeforeCompile) prev.call(m, sh, r);
+    Object.assign(sh.uniforms, U);
+    sh.fragmentShader = 'uniform float uGlassDirt;\nuniform float uLensCover;\nuniform vec3 uLensFwd;\nuniform vec3 uLensLeft;\nuniform vec3 uLensUp;\n' + sh.fragmentShader
+      .replace('#include <opaque_fragment>', `{
+        vec3 lV = normalize( vViewPosition );
+        vec3 lN = normal;
+        vec3 lNg = nonPerturbedNormal;
+        vec3 lF = normalize( ( viewMatrix * vec4( uLensFwd, 0.0 ) ).xyz );
+        vec3 lL = normalize( ( viewMatrix * vec4( uLensLeft, 0.0 ) ).xyz );
+        vec3 lU = normalize( ( viewMatrix * vec4( uLensUp, 0.0 ) ).xyz );
+        #ifdef USE_MAP
+          vec2 lp = vec2( vMapUv.x - 0.5, 0.5 - vMapUv.y ) * 0.18;     // lamp-local (car left, up) in metres
+        #else
+          vec2 lp = vec2( 0.0 );
+        #endif
+        vec3 lT = refract( -lV, lN, 0.6667 );
+        vec3 lT2 = refract( lT, lNg, 1.5 );
+        if ( dot( lT2, lT2 ) < 1e-4 ) lT2 = reflect( lT, -lNg );
+        float lz = max( -dot( lT2, lF ), 0.08 );
+        vec2 ltl = vec2( dot( lT2, lL ), dot( lT2, lU ) ) / lz;          // lateral drift per metre of depth
+        float lr = length( lp );
+        float ldep = clamp( 0.075 - lr * lr / 0.106, 0.004, 0.075 );
+        vec2 lbp = lp + ltl * ldep; float lbr0 = length( lbp ), lbr = min( lbr0, 0.087 );
+        vec3 lrad = lbr > 1e-4 ? normalize( lbp.x * lL + lbp.y * lU ) : lF;
+        vec3 lnb = normalize( lF - ( lbr / 0.053 ) * lrad );             // paraboloid normal (inward, toward the lens)
+        vec3 lRw = transformDirectionByInverseViewMatrix( reflect( lT2, lnb ), viewMatrix );
+        float lDown = smoothstep( 0.05, -0.25, lRw.y );                   // rays leaving toward the road / grille:
+        lRw.y = abs( lRw.y ) * 0.75 + 0.1; lRw = normalize( lRw );       // 2nd bounce sends most of them skyward
+        #ifdef ENVMAP_TYPE_CUBE_UV
+          vec3 lBowl = textureCubeUV( envMap, envMapRotation * lRw, 0.07 ).rgb * envMapIntensity * 0.72 * ( 1.0 - 0.8 * lDown );
+        #else
+          vec3 lBowl = vec3( 0.45 );
+        #endif
+        #if defined( USE_FOG ) && !defined( HTUNNEL_OFF )
+          lBowl *= htunnel_occ( cameraPosition + vHFogRel );
+        #endif
+        lBowl *= 1.0 - 0.85 * smoothstep( 0.078, 0.095, lbr0 );          // refracted past the bowl rim: dark housing
+        // steep prism flanks squeeze the dark hole / bulb / pocket into thin dark lines (ray-traced reference, car.py preview)
+        lBowl *= 1.0 - 0.5 * smoothstep( 0.22, 0.55, length( lN - lNg ) );
+        // H4 bulb in the focus: clear envelope (r 5.8 mm, 34-66 mm deep) dims the bowl, the black tip cap blocks it
+        float lrb = length( lp + ltl * 0.045 ), lrt = length( lp + ltl * 0.034 );
+        lBowl *= mix( 0.45, 1.0, smoothstep( 0.0050, 0.0062, lrb ) );
+        lBowl *= mix( 0.03, 1.0, smoothstep( 0.0038, 0.0052, lrt ) );
+        float lFr = 0.04 + 0.96 * pow( 1.0 - clamp( dot( lN, lV ), 0.0, 1.0 ), 5.0 );
+        float glDirt = uGlassDirt * smoothstep( 0.25, 0.9, roughnessFactor );
+        vec3 glSpec = outgoingLight - totalDiffuse - totalEmissiveRadiance;
+        vec3 lTrans = lBowl * ( 1.0 - lFr ) * 0.92 * clamp( 1.0 - 1.3 * glDirt, 0.0, 1.0 );
+        float lCov = uLensCover * ( 1.0 - smoothstep( 0.084, 0.0885, lr ) );   // flange: plain glass over the ring
+        float glA = clamp( lCov + glDirt + 0.08, 0.0, 1.0 );
+        if ( !gl_FrontFacing ) { glSpec *= 0.1; }
+        gl_FragColor = vec4( ( lCov * lTrans + totalDiffuse * glDirt + glSpec + totalEmissiveRadiance ) / max( glA, 1e-3 ), glA );
+      }`);
+  };
+  const prevKey = m.customProgramCacheKey;
+  const base = prevKey && prevKey !== THREE.Material.prototype.customProgramCacheKey ? prevKey.call(m) : '';
+  m.customProgramCacheKey = () => base + '|car_lens_v1';
+  m.needsUpdate = true;
+}
+
 /** Low-poly inset shadow caster: body boxes + wheels + spare wheel + roof rack. Invisible in the main pass. */
 function buildShadowProxy(spec, json, wheels) {
   const geos = [];
@@ -1494,79 +1617,145 @@ function makeContactTexture(spec, wheels, sx, sz) {
 
 // ------------------------------------------------------------------------------------------------ tyre spray
 /**
- * Wet-road tyre spray: the mist "rooster tail" every car throws on a wet road, plus a few heavier droplets. One draw
- * call (instanced camera-facing quads, simulated analytically in the vertex shader from spawn state: drag + gravity),
- * a small CPU ring buffer only writes newly spawned particles. Lit as sky-lit water mist, alpha blended, height fog.
+ * Wet-road tyre spray + exhaust vapour. One draw call: instanced quads simulated analytically in the vertex shader from
+ * their spawn state (drag toward a per-particle air velocity + gravity); a small CPU ring buffer only writes newly
+ * spawned particles.
+ *
+ * (v5, lead review: "discrete round white blobs") What a small 4x4 at 40-60 km/h throws off a road with a ~0.5-1 mm
+ * water film is a thin, translucent, streaky veil: the tread flings water back/up/out at ~tyre surface speed, the
+ * big drops (0.5-3 mm, drawn by particles.js as streaks) fall out within a metre, and the fine mist (< 0.1 mm, terminal
+ * speed < 0.3 m/s) is caught in the car's wake, which drags it along at ~0.3-0.45x car speed and lifts it to ~1 m.
+ * Visible only as a faint brightening against dark asphalt / rock, never against the sky. So:
+ *  - every sprite is a volume ELLIPSOID elongated along its car-relative stream velocity (projected exactly: seen
+ *    end-on it is a narrow disc, from the side a long streak), textured with streaky noise along the stream;
+ *  - its density is ERODED by an independent noise with age (it breaks up into wisps instead of fading as a disc)
+ *    and grained by a fine droplet noise;
+ *  - soft depth fade against the opaque scene (post.depthUniforms) where it touches the road / tyres, near-camera fade;
+ *  - low density (~40-70 sprites alive), 0 on a dry road: the tunnel (terrain.insideTunnel) and dry surfaces.
+ * The exhaust's condensation plume (cold, saturated air) is only visible at idle / creeping: at speed it mixes out
+ * within a metre, so it is cut above ~5 m/s (it used to trail a line of 1.5 m puffs down the road).
  */
 const SPRAY_VERT = /* glsl */`
   #include <common>
   #include <fog_pars_vertex>
-  attribute vec3 aP0; attribute vec3 aV0; attribute vec4 aT; // aT: birth time, life, size0, size1
-  attribute vec4 aK;                                           // aK: drag, gravity scale (<0 rises), seed, opacity
-  uniform float uTime; uniform vec3 uWind; uniform mat4 uCarInv;
-  varying vec2 vUv; varying float vA; varying float vSeed;
+  attribute vec3 aP0; attribute vec3 aV0; attribute vec3 aA; // spawn position, spawn velocity (ground frame), air velocity it relaxes to
+  attribute vec4 aT;                                           // birth time, life, half-width at birth, half-width at death
+  attribute vec4 aK;                                           // drag (1/s), gravity scale, seed, opacity
+  attribute float aX;                                          // elongation per m/s of car-relative stream speed
+  uniform float uTime; uniform mat4 uCarInv; uniform vec3 uCarVel;
+  varying vec2 vUv; varying float vA; varying float vSeed; varying float vT; varying float vStr; varying vec3 vCp;
   void main() {
     float age = uTime - aT.x;
     float life = aT.y;
-    vUv = uv; vSeed = aK.z;
+    vUv = uv; vSeed = aK.z; vT = 0.0; vStr = 0.0; vCp = vec3(0.0);
     if (age < 0.0 || age > life) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vA = 0.0; return; }
-    float k = aK.x;
-    float e = (1.0 - exp(-k * age)) / k;
-    float g = 9.81 * aK.y;
-    // velocity decays toward the wind; gravity pulls against drag (terminal speed g/k)
-    vec3 wp = aP0 + (aV0 - uWind) * e + uWind * age;
+    float k = aK.x, ek = exp(-k * age), e = (1.0 - ek) / k, g = 9.81 * aK.y;
+    vec3 wp = aP0 + (aV0 - aA) * e + aA * age;
     wp.y -= g / k * (age - e);
+    vec3 vel = (aV0 - aA) * ek + aA;
+    vel.y -= g / k * (1.0 - ek);
     float t = age / life;
-    float size = mix(aT.z, aT.w, 1.0 - (1.0 - t) * (1.0 - t));
-    vec4 mvPosition = viewMatrix * vec4(wp, 1.0);
-    float ang = aK.z * 6.2831 + age * (aK.z - 0.5) * 0.8;
-    vec2 c = (uv - 0.5) * size;
-    mvPosition.xy += vec2(c.x * cos(ang) - c.y * sin(ang), c.x * sin(ang) + c.y * cos(ang));
+    vT = t;
+    float W = mix(aT.z, aT.w, 1.0 - (1.0 - t) * (1.0 - t));
+    // ellipsoid (half-length L along the car-relative stream, half-width W) projected onto the view plane
+    vec3 rel = vel - uCarVel;
+    float rl = length(rel);
+    vec3 ax = rl > 0.05 ? rel / rl : vec3(0.0, 1.0, 0.0);
+    float L = W * (1.0 + aX * rl);
+    vec3 vd = normalize(wp - cameraPosition);
+    vec3 axp = ax - vd * dot(ax, vd);
+    float s2 = dot(axp, axp);                                   // sin^2(stream, view ray)
+    vec3 camUp = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+    vec3 a1 = s2 > 1e-4 ? axp * inversesqrt(s2) : normalize(camUp - vd * dot(camUp, vd));
+    vec3 a2 = normalize(cross(a1, vd));                        // (a1 x a2 = -vd: front face toward the camera)
+    float Lp = sqrt(L * L * s2 + W * W * (1.0 - s2));
+    vStr = clamp((Lp / W - 1.0) * 0.8, 0.0, 1.0);             // 0 = seen end-on (isotropic texture), 1 = streaky
+    vec2 c = (uv - 0.5) * 2.0;
+    vec4 mvPosition = viewMatrix * vec4(wp + a1 * (c.x * Lp) + a2 * (c.y * W), 1.0);
     gl_Position = projectionMatrix * mvPosition;
-    vA = smoothstep(0.0, 0.08, t) * (1.0 - smoothstep(0.15, 1.0, t)) * aK.w;
-    // (v4) vapour/mist that drifts into the body shell (wind pushing exhaust forward) must not appear in the cabin
+    vA = smoothstep(0.0, 0.07, t) * (1.0 - smoothstep(0.12, 1.0, t)) * aK.w;   // densest just behind the tread
+    vA *= smoothstep(0.6, 2.2, -(viewMatrix * vec4(wp, 1.0)).z);   // never smear over the chase / cockpit lens
+    // mist / vapour that drifts into the body shell must not appear in the cabin
     vec3 cp = (uCarInv * vec4(wp, 1.0)).xyz;
+    vCp = cp;
     vec3 dq = abs(cp - vec3(0.0, 1.05, -0.05)) - vec3(0.80, 0.62, 1.80);
     vA *= smoothstep(-0.05, 0.25, max(dq.x, max(dq.y, dq.z)));
+    if (vA < 0.004) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }   // faded out / at the lens: no raster cost
     #include <fog_vertex>
   }`;
 const SPRAY_FRAG = /* glsl */`
   #include <common>
+  #include <packing>
   #include <fog_pars_fragment>
   uniform sampler2D uTex; uniform vec3 uLight; uniform float uOpacity;
-  varying vec2 vUv; varying float vA; varying float vSeed;
+  uniform vec3 uTailCol; uniform vec3 uTailL; uniform vec3 uTailR;
+  #ifdef SOFT
+  uniform sampler2D tSceneDepth; uniform vec2 sceneDepthRes; uniform vec2 sceneCamNF;
+  #endif
+  varying vec2 vUv; varying float vA; varying float vSeed; varying float vT; varying float vStr; varying vec3 vCp;
   void main() {
+    // one of 4 atlas cells, randomly mirrored across the stream axis
     vec2 uv = vUv;
-    // two quadrants of the puff atlas (2x2) chosen by seed
+    if (fract(vSeed * 7.31) > 0.5) uv.y = 1.0 - uv.y;
     float q = floor(vSeed * 3.999);
     uv = uv * 0.5 + vec2(mod(q, 2.0), floor(q / 2.0)) * 0.5;
-    float d = texture2D(uTex, uv).r;
-    float a = d * vA * uOpacity;
-    if (a < 0.003) discard;
-    gl_FragColor = vec4(uLight * (0.85 + 0.3 * d), a);
+    vec4 tx = texture2D(uTex, uv);   // r: streaky density, g: erosion noise, b: isotropic density, a: droplet grain
+    float dens = mix(tx.b, tx.r, vStr);
+    float er = -0.3 + 1.05 * pow(vT, 1.25);                   // erosion front: wisps survive, the body dissolves
+    dens *= smoothstep(er, er + 0.32, tx.g);
+    dens *= 0.45 + 1.1 * tx.a;
+    float a = dens * vA * uOpacity;
+    #ifdef SOFT
+      float sceneZ = perspectiveDepthToViewZ(texture2D(tSceneDepth, gl_FragCoord.xy / sceneDepthRes).r, sceneCamNF.x, sceneCamNF.y);
+      float fragZ = perspectiveDepthToViewZ(gl_FragCoord.z, sceneCamNF.x, sceneCamNF.y);
+      a *= clamp((fragZ - sceneZ) / 0.35, 0.0, 1.0);
+    #endif
+    if (a < 0.0015) discard;
+    // rear lamps light the mist right behind them (visible when braking / in the dark)
+    vec3 dl = vCp - uTailL, dr = vCp - uTailR;
+    vec3 tail = uTailCol * (exp(-dot(dl, dl) * 2.2) + exp(-dot(dr, dr) * 2.2));
+    gl_FragColor = vec4(uLight * (0.82 + 0.36 * dens) + tail, a);
     #include <fog_fragment>
   }`;
 
+/** Will post.depthUniforms exist? (post inits after the car; decide at construction so no recompile is needed later) */
+const sprayExpectSoft = (ctx) => !ctx.flags?.nopost && (!ctx.flags?.only || ctx.flags.only.includes('post'));
+let _sprayDepthDummy = null;
+
 class TyreSpray {
-  constructor(vehicle, cap = 700) {
+  constructor(vehicle, cap = 480) {
     this.v = vehicle; this.cap = cap; this.head = 0; this.time = 0;
     const base = new THREE.PlaneGeometry(1, 1);
     const g = new THREE.InstancedBufferGeometry();
     g.index = base.index; g.setAttribute('position', base.attributes.position); g.setAttribute('uv', base.attributes.uv);
-    this.aP0 = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
-    this.aV0 = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
-    this.aT = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4).fill(-1000), 4);
-    this.aK = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4).fill(1), 4);
-    for (const a of [this.aP0, this.aV0, this.aT, this.aK]) a.setUsage(THREE.DynamicDrawUsage);
-    g.setAttribute('aP0', this.aP0); g.setAttribute('aV0', this.aV0); g.setAttribute('aT', this.aT); g.setAttribute('aK', this.aK);
+    const A = (n, fill = 0) => new THREE.InstancedBufferAttribute(new Float32Array(cap * n).fill(fill), n);
+    this.aP0 = A(3); this.aV0 = A(3); this.aA = A(3); this.aT = A(4, -1000); this.aK = A(4, 1); this.aX = A(1);
+    this.attrs = [this.aP0, this.aV0, this.aA, this.aT, this.aK, this.aX];
+    for (const a of this.attrs) a.setUsage(THREE.DynamicDrawUsage);
+    g.setAttribute('aP0', this.aP0); g.setAttribute('aV0', this.aV0); g.setAttribute('aA', this.aA);
+    g.setAttribute('aT', this.aT); g.setAttribute('aK', this.aK); g.setAttribute('aX', this.aX);
     g.instanceCount = cap;
     const ctx = vehicle.ctx;
-    this.u = { uTime: { value: 0 }, uWind: { value: new THREE.Vector3(0.6, 0, 0.25) }, uTex: { value: makePuffTexture() },
-      uLight: { value: new THREE.Color(0.4, 0.42, 0.45) }, uOpacity: { value: 0.085 },
-      uCarInv: vehicle._cabinUniforms?.().uWorldToCar ?? { value: new THREE.Matrix4().makeTranslation(0, -1e4, 0) } };
+    this.soft = sprayExpectSoft(ctx);
+    if (this.soft && !_sprayDepthDummy) {
+      _sprayDepthDummy = new THREE.DataTexture(new Float32Array([1, 1, 1, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType);
+      _sprayDepthDummy.needsUpdate = true;
+    }
+    const bl = vehicle.json?.brakelights;
+    const tl = Array.isArray(bl) && bl.length === 2 ? bl : [[0.735, 0.86, -1.77], [-0.735, 0.86, -1.77]];
+    this.u = {
+      uTime: { value: 0 }, uTex: { value: makeSprayTexture() }, uOpacity: { value: 1 },
+      uLight: { value: new THREE.Color(0.4, 0.42, 0.45) }, uCarVel: { value: new THREE.Vector3() },
+      uTailCol: { value: new THREE.Color(0, 0, 0) },
+      uTailL: { value: new THREE.Vector3().fromArray(tl[0]).add(new THREE.Vector3(0, 0, -0.25)) },
+      uTailR: { value: new THREE.Vector3().fromArray(tl[1]).add(new THREE.Vector3(0, 0, -0.25)) },
+      uCarInv: vehicle._cabinUniforms?.().uWorldToCar ?? { value: new THREE.Matrix4().makeTranslation(0, -1e4, 0) },
+    };
+    if (this.soft) Object.assign(this.u, { tSceneDepth: { value: _sprayDepthDummy }, sceneDepthRes: { value: new THREE.Vector2(1, 1) }, sceneCamNF: { value: new THREE.Vector2(0.08, 6000) } });
     this.mat = new THREE.ShaderMaterial({
       uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, ctx.env?.fogUniforms ?? {}, {}]),
       vertexShader: SPRAY_VERT, fragmentShader: SPRAY_FRAG, fog: true, transparent: true, depthWrite: false,
+      defines: this.soft ? { SOFT: '' } : {},
     });
     Object.assign(this.mat.uniforms, this.u); // share our uniform objects (merge() clones them)
     this.mesh = new THREE.Mesh(g, this.mat);
@@ -1575,15 +1764,24 @@ class TyreSpray {
     this.mesh.renderOrder = 5;
     this._acc = [0, 0, 0, 0];
     this._dirty = false; this._lo = cap; this._hi = -1;
-    this.alive = 0;
+    this.wetness = 0;          // 0..1 current spray intensity (debug / tests)
   }
 
-  _spawn(p, vel, life, s0, s1, drag, grav, alpha = 1) {
+  /** Number of live particles (debug; scans the ring buffer). */
+  get alive() {
+    let n = 0; const T = this.aT.array;
+    for (let i = 0; i < this.cap; i++) { const age = this.time - T[i * 4]; if (age >= 0 && age <= T[i * 4 + 1]) n++; }
+    return n;
+  }
+
+  _spawn(p, vel, air, life, w0, w1, drag, grav, stretch, alpha) {
     const i = this.head; this.head = (this.head + 1) % this.cap;
     this.aP0.array.set([p.x, p.y, p.z], i * 3);
     this.aV0.array.set([vel.x, vel.y, vel.z], i * 3);
-    this.aT.array.set([this.time, life, s0, s1], i * 4);
+    this.aA.array.set([air.x, air.y, air.z], i * 3);
+    this.aT.array.set([this.time, life, w0, w1], i * 4);
     this.aK.array.set([drag, grav, Math.random(), alpha], i * 4);
+    this.aX.array[i] = stretch;
     this._lo = Math.min(this._lo, i); this._hi = Math.max(this._hi, i);
     this._dirty = true;
   }
@@ -1593,56 +1791,64 @@ class TyreSpray {
     this.time += dt;
     this.u.uTime.value = this.time;
     if (!vc || !v.body || dt <= 0) return;
+    // soft particles: share post's opaque-depth copy (post inits after the car; null with ?nopost)
+    if (this.soft) {
+      const du = ctx.post?.depthUniforms;
+      if (du) { this.u.tSceneDepth.value = du.tSceneDepth.value; this.u.sceneDepthRes.value.copy(du.sceneDepthRes.value); this.u.sceneCamNF.value.copy(du.sceneCamNF.value); }
+    }
     const wet = ctx.env?.wetness ?? 0.75, rain = ctx.env?.rain ?? 0.35;
-    // sky-lit mist colour follows the sky light (dimmer in the tunnel / under lightning flashes brighter)
-    const pr = v._proj;
-    const inTunnel = pr && ctx.road?.markers && pr.s > ctx.road.markers.tunnel + 4 && pr.s < ctx.road.markers.tunnelEnd;
-    if (inTunnel) this.u.uLight.value.setRGB(0.07, 0.05, 0.03); // sodium-lit
-    else this.u.uLight.value.setRGB(0.4, 0.42, 0.45);
+    let inT = 0;
+    try { inT = ctx.terrain?.insideTunnel?.(v.object.position) ?? 0; } catch { inT = 0; }
+    // mist colour follows the light: overcast sky outside, dim sodium light in the tunnel, lightning flashes
+    const fl = Math.min(ctx.env?.flashLevel ?? 0, 2);
+    this.u.uLight.value.setRGB(lerp(0.4, 0.075, inT) * (1 + fl), lerp(0.42, 0.052, inT) * (1 + fl), lerp(0.45, 0.03, inT) * (1 + fl));
+    const brakeK = v.lights?.brake ? 0.30 : 0, tailK = v.lights?.head ? 0.035 : 0;
+    this.u.uTailCol.value.setRGB(1.0, 0.035, 0.015).multiplyScalar(brakeK + tailK);
     const q = v.object.quaternion;
     const fwd = _s1.set(0, 0, 1).applyQuaternion(q), left = _s2.set(1, 0, 0).applyQuaternion(q);
     const lv = v.body.linvel();
+    this.u.uCarVel.value.set(lv.x, lv.y, lv.z);
     const spd = Math.abs(v.speed);
-    const water = clamp(wet * 1.1 - 0.15, 0, 1) * (inTunnel ? 0.25 : 1);
+    const wind = _s5.set(0.6, 0, 0.25);
+    // water film: the rain-wet road; the tunnel road is dry a metre past the portal (no spray at all inside)
+    const water = clamp(wet * 1.1 - 0.15, 0, 1) * (1 - smooth01(0.02, 0.2, inT));
+    this.wetness = water;
     for (let i = 0; i < 4; i++) {
       const w = v.wheels[i];
-      if (!vc.wheelIsInContact(i) || water <= 0.02) { this._acc[i] = 0; continue; }
+      if (!w || !vc.wheelIsInContact(i) || water <= 0.02) { this._acc[i] = 0; continue; }
       const surf = v._surf[i];
       const sm = surf === 'asphalt' ? 1 : surf === 'rock' || surf === 'wood' ? 0.7 : surf === 'gravel' ? 0.45 : 0.25;
       const I = water * sm * smooth01(3.5, 18, spd);
       if (I <= 0.01) { this._acc[i] = 0; continue; }
-      // rear wheels run in the wet track of the front ones and throw the bigger plume
-      // (QA) twice the puffs at ~0.55x the opacity each: the plume integrates into a continuous low-contrast
-      // haze behind the tyres (as on dashcam footage) instead of separate round blobs on the dark asphalt
-      const rate = (w.front ? 52 : 76) * I * (0.7 + 0.6 * rain);
+      // rear tyres run in the front tyres' wet track and throw into the wake: the bigger, higher plume
+      const rate = (w.front ? 13 : 22) * I * (0.75 + 0.5 * rain);
       this._acc[i] += rate * dt;
       const cp = vc.wheelContactPoint(i);
       if (!cp) continue;
       const dir = v.speed >= 0 ? 1 : -1;
+      const side = w.left ? 1 : -1;
       let n = 0;
-      while (this._acc[i] >= 1 && n++ < 10) {
+      while (this._acc[i] >= 1 && n++ < 6) {
         this._acc[i] -= 1;
-        const side = (w.left ? 1 : -1);
-        const lat = (Math.random() - 0.3) * 0.2 * side;
-        const p = _s3.set(cp.x, cp.y, cp.z).addScaledVector(fwd, -dir * (0.3 + Math.random() * 0.25)).addScaledVector(left, lat);
-        p.y += 0.12 + Math.random() * 0.2;
-        const heavy = Math.random() < 0.18;
-        // ground-frame launch velocity: carried along with the car, thrown up/back off the tread and out sideways
-        const up = (heavy ? 1.2 : 0.7) + Math.random() * 1.1 + spd * 0.05;
-        const back = -dir * spd * (0.15 + Math.random() * 0.2);
-        const out = side * (0.3 + Math.random() * 0.8) * (0.5 + spd * 0.03);
-        const vel = _s4.set(lv.x * 0.55, 0, lv.z * 0.55).addScaledVector(fwd, back).addScaledVector(left, out);
-        vel.y = up;
-        // heavy droplets: 2-6 mm drops, a few cm across even motion-blurred (a 35 cm puff read as a white blob)
-        if (heavy) this._spawn(p, vel, 0.4 + Math.random() * 0.3, 0.03, 0.06, 2.2, 0.55, 0.6);
-        // (QA) a small car at 40-50 km/h on a ~1 mm water film throws a plume ~1 m high that is gone in ~0.5 s (the
-        // 2.4 m, 1.2 s puffs hung on the road behind the car as discrete pale blobs in the chase view)
-        else this._spawn(p, vel, 0.38 + Math.random() * 0.35 * I, 0.25 + 0.12 * Math.random(), 0.6 + 0.6 * I + Math.random() * 0.3, 3.2, 0.04);
+        const r = Math.random;
+        const p = _s3.set(cp.x, cp.y, cp.z).addScaledVector(fwd, -dir * (0.28 + r() * 0.3)).addScaledVector(left, (r() - 0.35) * 0.18 * side);
+        p.y += 0.1 + r() * 0.16;
+        // ground-frame launch: car velocity + tread fling (back at ~0.6-0.85x the tyre surface speed, up, out)
+        const vel = _s4.set(lv.x, 0, lv.z)
+          .addScaledVector(fwd, -dir * spd * (0.6 + r() * 0.25))
+          .addScaledVector(left, side * (0.25 + r() * 0.8) * (0.5 + spd * 0.03));
+        vel.y = 1.0 + r() * 1.6 + spd * 0.05;
+        // the wake drags the mist along (0.3-0.45x car speed behind the box body) and lifts it
+        const wk = w.front ? 0.15 + r() * 0.15 : 0.3 + r() * 0.15;
+        const air = _s6.set(lv.x * wk + wind.x, (w.front ? 0.1 : 0.25) + r() * 0.35, lv.z * wk + wind.z);
+        const life = (0.45 + r() * 0.45) * (0.8 + 0.3 * I);
+        const w0 = 0.12 + r() * 0.08, w1 = (0.26 + r() * 0.2) * (0.75 + 0.5 * I) * (w.front ? 0.8 : 1);
+        this._spawn(p, vel, air, life, w0, w1, 2.6 + r() * 1.2, 0.05, 0.2 + r() * 0.12, (0.25 + r() * 0.12) * (0.65 + 0.35 * I));
       }
     }
-    this._exhaust(dt, fwd, left, lv, spd, rain);
+    this._exhaust(dt, fwd, left, lv, spd, rain, wind, inT);
     if (this._dirty) {
-      for (const a of [this.aP0, this.aV0, this.aT, this.aK]) {
+      for (const a of this.attrs) {
         a.clearUpdateRanges();
         a.addUpdateRange(this._lo * a.itemSize, (this._hi - this._lo + 1) * a.itemSize);
         a.needsUpdate = true;
@@ -1651,50 +1857,81 @@ class TyreSpray {
     }
   }
 
-  /** Cold, wet air: the old carburettor engine's exhaust condenses into white vapour (strongest at idle / standstill). */
-  _exhaust(dt, fwd, left, lv, spd, rain) {
+  /** Cold, saturated air: the carburettor engine's exhaust condenses into a white wisp at idle / creeping speed. At
+   *  speed the plume is stretched thin and mixes out within ~1 m (invisible), so it is cut above ~5 m/s. */
+  _exhaust(dt, fwd, left, lv, spd, rain, wind, inT) {
     const v = this.v;
     const on = v.engineOn && !(v._starve > 0);
-    const crankPuff = v.cranking > 0 ? 1 : 0;
-    if (!on && !crankPuff) { this._exAcc = 0; return; }
+    const crank = v.cranking > 0;
+    const vis = 1 - smooth01(1.2, 5.0, spd);
+    if ((!on && !crank) || vis <= 0.01) { this._exAcc = 0; return; }
     const load = clamp(v.rpm / 3000, 0.25, 2) * (0.6 + 0.8 * v.throttle);
-    const vis = 1 / (1 + spd / 4);               // at speed the plume is stretched thin and dilutes quickly
-    this._exAcc = (this._exAcc || 0) + dt * (6 + 10 * load) * (0.5 + 0.5 * vis);
+    this._exAcc = (this._exAcc || 0) + dt * (5 + 6 * load) * vis;
     const ex = v.exhaustPoint;
     let n = 0;
-    while (this._exAcc >= 1 && n++ < 4) {
+    while (this._exAcc >= 1 && n++ < 3) {
       this._exAcc -= 1;
+      const r = Math.random;
       const p = _s3.copy(ex).applyMatrix4(v.object.matrixWorld);
-      const vel = _s4.set(lv.x, lv.y, lv.z).addScaledVector(fwd, -(1.2 + 1.6 * load) + Math.random() * 0.4)
-        .addScaledVector(left, (Math.random() - 0.5) * 0.4);
-      vel.y += 0.1 + Math.random() * 0.25;
-      // x2.45: compensates the spray's lower uOpacity (0.21 -> 0.085, QA) so the exhaust vapour keeps its density
-      const a = 2.45 * (0.55 + 0.35 * vis) * (0.8 + 0.4 * rain) * (v.stalling ? 1.3 : 1);
-      this._spawn(p, vel, 1.6 + Math.random() * 1.4, 0.07, 0.7 + Math.random() * 0.5 + 0.3 * load, 1.6, -0.012, a);
+      const vel = _s4.set(lv.x, lv.y, lv.z).addScaledVector(fwd, -(1.1 + 1.3 * load) - r() * 0.4)
+        .addScaledVector(left, (r() - 0.5) * 0.35);
+      vel.y += 0.05 + r() * 0.15;
+      // warm, buoyant vapour drifts off with the breeze and rises
+      const air = _s6.copy(wind).setY(0.2 + r() * 0.2);
+      air.x += lv.x * 0.3; air.z += lv.z * 0.3;
+      const a = (0.11 + 0.05 * r()) * vis * (0.8 + 0.4 * rain) * (v.stalling ? 1.3 : 1) * (crank ? 1.4 : 1) * (1 - 0.3 * inT);
+      this._spawn(p, vel, air, 1.0 + r() * 0.9, 0.025, 0.2 + r() * 0.15 + 0.08 * load, 1.8, 0.0, 0.3, a);
     }
   }
 
   dispose() { this.mesh.geometry.dispose(); this.mat.dispose(); this.u.uTex.value.dispose(); }
 }
 const _s1 = new THREE.Vector3(), _s2 = new THREE.Vector3(), _s3 = new THREE.Vector3(), _s4 = new THREE.Vector3();
+const _s5 = new THREE.Vector3(), _s6 = new THREE.Vector3();
 
-/** 2x2 atlas of soft, lumpy mist puffs (R channel = density), generated procedurally. */
-function makePuffTexture() {
+/**
+ * 2x2 atlas of mist sprites, u = along the stream. RGBA8:
+ *   r: streaky density (value noise stretched ~10:1 along u, several octaves, under a soft elliptical envelope),
+ *   g: erosion noise (isotropic, mid frequency: the threshold rises with age so the sprite breaks into wisps),
+ *   b: isotropic mottled density (used when the stream is seen end-on),
+ *   a: fine droplet grain.
+ */
+function makeSprayTexture() {
   const N = 128, S = N * 2;
   const data = new Uint8Array(S * S * 4);
-  let seed = 7;
+  let seed = 11;
   const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const P = 64, lat = new Float32Array(P * P);
+  for (let i = 0; i < P * P; i++) lat[i] = rnd();
+  const vn = (x, y) => {   // periodic value noise on a 64x64 lattice
+    const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const x0 = ((xi % P) + P) % P, y0 = ((yi % P) + P) % P, x1 = (x0 + 1) % P, y1 = (y0 + 1) % P;
+    const a = lat[y0 * P + x0], b = lat[y0 * P + x1], c = lat[y1 * P + x0], d = lat[y1 * P + x1];
+    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+  };
   for (let qy = 0; qy < 2; qy++) for (let qx = 0; qx < 2; qx++) {
-    const blobs = [];
-    for (let b = 0; b < 14; b++) { const a = rnd() * 6.283, r = Math.sqrt(rnd()) * 0.26; blobs.push([0.5 + Math.cos(a) * r, 0.5 + Math.sin(a) * r, 0.1 + rnd() * 0.16, 0.4 + rnd() * 0.6]); }
+    const ox = rnd() * 40, oy = rnd() * 40, cell = qy * 2 + qx;
+    const bend = (rnd() - 0.5) * 0.5;          // streaks curve a little (turbulent wake)
     for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
       const u = (x + 0.5) / N, w = (y + 0.5) / N;
-      let d = 0;
-      for (const [bx, by, br, bs] of blobs) { const dd = ((u - bx) ** 2 + (w - by) ** 2) / (br * br); d += bs * Math.exp(-dd * 2.2); }
-      const r = Math.hypot(u - 0.5, w - 0.5) / 0.5;
-      d = clamp(d * 0.55, 0, 1) * (1 - smooth01(0.55, 1.0, r));
-      const k = ((qy * N + y) * S + qx * N + x) * 4, b = Math.round(d * 255);
-      data[k] = data[k + 1] = data[k + 2] = b; data[k + 3] = 255;
+      const du = (u - 0.5) * 2, dw = (w - 0.5) * 2;
+      // envelope: soft ellipse, denser toward the leading third, ragged edge
+      const edge = 0.14 * (vn(ox + u * 5, oy + w * 5) - 0.5);
+      const rr = Math.sqrt(du * du * 0.92 + dw * dw) + edge;
+      const env = 1 - smooth01(0.3, 1.0, rr);
+      const wb = w + bend * du * du;
+      let st = 0.55 * vn(ox + u * 2.2, oy + wb * 16) + 0.33 * vn(ox + 7 + u * 4.5, oy + wb * 34) + 0.12 * vn(ox + 3 + u * 9, oy + wb * 60);
+      st = clamp((st - 0.3) * 1.9, 0, 1);
+      let iso = 0.55 * vn(ox + 11 + u * 6, oy + w * 6) + 0.3 * vn(ox + 5 + u * 13, oy + w * 13) + 0.15 * vn(ox + u * 26, oy + w * 26);
+      iso = clamp((iso - 0.25) * 1.8, 0, 1);
+      const er = 0.6 * vn(ox + 20 + u * 7, oy + 9 + w * 11) + 0.4 * vn(ox + 30 + u * 17, oy + 2 + w * 27);
+      const gr = vn(ox + u * 60 + cell * 13, oy + w * 60);
+      const k = ((qy * N + y) * S + qx * N + x) * 4;
+      data[k] = Math.round(clamp(st * env * 1.15, 0, 1) * 255);
+      data[k + 1] = Math.round(clamp(er, 0, 1) * 255);
+      data[k + 2] = Math.round(clamp(iso * env, 0, 1) * 255);
+      data[k + 3] = Math.round(clamp(gr * gr * 1.3, 0, 1) * 255);
     }
   }
   const tex = new THREE.DataTexture(data, S, S, THREE.RGBAFormat);

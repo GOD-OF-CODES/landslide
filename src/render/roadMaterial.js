@@ -2,7 +2,8 @@
 // Road: asphalt_02 (2048) with anti-tiling, worn edge/centre lines, cracks + tar snakes, repair patches,
 // polished tire tracks, wet sheen, noise puddles (mirror-smooth, rain ripples), mud/gravel washed over the
 // road near the scar, the gullies and the washout. UV0 = (d, s) in meters; COLOR_0: R = AO, G = puddle/damage.
-// Tunnel: precast_concrete_wall with grime + seepage, daylight falloff with depth, analytic sodium lamps.
+// Tunnel: cast-concrete portal (formwork panels, tie holes, runoff, name plate, delineators), rubble wing walls,
+// drainage channel, lining with grime + seepage, daylight falloff with depth, analytic sodium lamps.
 import * as THREE from 'three';
 import { GLSL_NOISE, loadTerrainArrays } from './terrainMaterial.js';
 
@@ -530,44 +531,419 @@ export async function createRoadMaterial(ctx) {
 // ---------------------------------------------------------------------------------------------
 // Tunnel (portal headwall, wing walls, tube)
 // ---------------------------------------------------------------------------------------------
+// Portal geometry (must match tools/blender/terrain.py build_tunnel): the headwall front face is 0.95 m before
+// markers.tunnel, spans d = +-15.2 m and h = -0.8..16.4 m above the portal road; a 0.85 m concrete ring projects
+// 0.25 m around the opening (opening half-width 4.9 m, springing line 1.9 m, arch radius 5.3 m, so the ring runs
+// r = 4.9..5.75 m about (d 0, h 1.9)); coping box h 16.4..17.0; pilasters at |d| 15.2..15.8.
+export const PORTAL = { front: -0.95, halfW: 15.2, top: 16.4, spring: 1.9, ringIn: 4.9, ringOut: 5.75, archH: 5.3, collar: 0.85, collarC: 3.2 };
+// name plate (world metres in the portal plane; x = screen-right for the approaching driver)
+const PLATE = { w: 6.6, h: 1.5, y0: 8.75 };
+const F = (x) => x.toFixed(4);   // GLSL float literal
+
 const TUN_FRAG_PARS = /* glsl */`
-uniform sampler2D uCon;
-uniform sampler2D uConN;
-uniform sampler2D uConArm;
 uniform sampler2D uCast;
 uniform sampler2D uCastN;
 uniform sampler2D uCastArm;
+uniform sampler2DArray uAlb;
+uniform sampler2DArray uNrm;
+uniform sampler2D uPlate;
 uniform float uWet;
+uniform float uTTime;
 uniform float uPortalY;
 uniform vec3 uPortalP;
+uniform vec3 uPortalL;
+uniform vec3 uPortalT;
 varying vec2 vTU;
 varying vec4 vMasks;
 varying vec3 vWPos;
 ${GLSL_NOISE}
 ${TUNNEL_GLSL}
 float tnRough; float tnAO; vec3 tnTN; float tnDay = 1.0; float tnIn = 0.0;
-vec3 tnT; vec3 tnB; vec3 tnN; vec3 tnNWg; float tnUseW = 0.0;   // world tangent frame (wing walls)
+vec3 tnT; vec3 tnB; vec3 tnN; vec3 tnNWg; float tnUseW = 0.0;   // world tangent frame (portal parts)
+// 1 at the centre of a thin line of half-width w (m) at distance x, antialiased over the pixel footprint aa
+// (energy-preserving: a line thinner than a pixel fades instead of widening to a full-strength pixel)
+float tn_line(float x, float w, float aa) { return (1.0 - smoothstep(w, w + aa, x)) * (2.0 * w + 0.25 * aa) / (2.0 * w + aa); }
 `;
 
+// Portal-parts shading (REAL-WORLD MODEL: cast-in-place Alpine portal, 1950s-60s, in steady rain):
+//  * Headwall: grey cast concrete (dry ~0.21 linear, wet ~0.11: porous concrete darkens 45-50 % when saturated) in
+//    formwork panels 2.7 x 1.35 m (pour lifts every 2.7 m), each panel its own tone (a different pour / face of
+//    the ply), 8 mm panel-joint fins, cold joints at the lifts that leak calcite, form-tie holes on a 0.9 x 1.35 m
+//    grid (26 mm hole, 56 mm mortar plug, rust bleed below 60 % of them), a dark drip curtain under the coping and
+//    runoff streaks (biofilm + dirt) that stay wet and glossier (roughness ~0.3 vs ~0.5), splash zone and moss at
+//    the base. The name plate is a recessed precast panel with raised, once-painted letters.
+//  * Ring: smoother precast arch ring with retroreflective delineator tiles (0.5 m red / white) around the arch
+//    and red/white hazard boards on the vertical sides.
+//  * Wing walls: older hand-laid coursed rubble (0.44 m courses, 0.4-0.9 m granite blocks, 2.5 cm recessed lime
+//    joints), pillowed stone faces, black cyanobacteria streaks from the coping, lichen, moss in the joints.
+//  * Drainage channel (JS mesh, part id 0.3): precast U-channel, water in the bottom (B mask) with rain rings.
+const TUN_MAP = /* glsl */`{
+  float tube = step(0.5, vMasks.a);
+  float wing = (1.0 - tube) * step(0.425, vMasks.g) * step(vMasks.g, 0.6);
+  float chan = (1.0 - tube) * (1.0 - step(0.35, vMasks.g));
+  float h = vWPos.y - uPortalY;                       // height above the portal road level (m)
+  vec3 c; vec3 arm;
+  vec2 tuv = vTU;
+  float rOv = -1.0;        // roughness override (< 0: none)
+  float keepWet = 0.0;     // runs / streaks that stay wet (glossier)
+  float dryish = 0.0;      // sheltered (dries lighter)
+  float mossM = 0.0;
+  // (derivatives in uniform control flow: inside the varying-dependent branches they are undefined)
+  vec3 wdx = dFdx(vWPos), wdy = dFdy(vWPos);
+  float aaW = max(max(length(wdx), length(wdy)), 1e-4);   // world metres per pixel
+  // interpolated vertex normal, not the derivative one: fp32 derivatives at x ~1100 m jitter ~1 % per pixel quad
+  tnN = normalize((vec4(vNormal, 0.0) * viewMatrix).xyz);
+  vec3 wp = vWPos - uPortalP;
+  if (tube > 0.5) {
+    // cast concrete lining: rotate the scan so its pour lines run horizontally on the walls
+    vec2 uv = vTU / 4.4;
+    c = texture(uCast, uv).rgb; arm = texture(uCastArm, uv).rgb;
+    tnTN = texture(uCastN, uv).xyz * 2.0 - 1.0;
+    c *= 1.3;
+    float n1 = th_fbm(vWPos.xz * 0.3 + vWPos.y * 0.2);
+    c *= 0.88 + 0.24 * n1;
+    float jd = abs(fract((vTU.y - ${TUNNEL.s0}.0) / 11.0 + 0.5) - 0.5) * 11.0;      // m to the nearest ring joint
+    float joint = 1.0 - smoothstep(0.012, 0.03 + aaW, jd);
+    c *= 1.0 - 0.35 * joint * (0.6 + 0.4 * th_vnoise(vTU * vec2(1.5, 0.3)));
+    tnTN = normalize(mix(tnTN, vec3(sign(fract((vTU.y - ${TUNNEL.s0}.0) / 11.0 + 0.5) - 0.5), 0.0, 0.6), joint * 0.6));
+    // exhaust soot toward the crown, blotchy
+    float crown = smoothstep(6.5, 9.5, vTU.x) * (1.0 - smoothstep(14.0, 17.0, vTU.x)); // profile arc ~23.4 m, crown ~11.7
+    c *= 1.0 - 0.45 * crown * (0.6 + 0.4 * th_vnoise(vTU * vec2(0.8, 0.15)));
+    // road spray grime on the lower walls, tide marks / efflorescence near the kerb
+    c = mix(c, c * vec3(0.4, 0.38, 0.35), vMasks.g * (0.6 + 0.4 * n1));
+    float kerb = 1.0 - smoothstep(0.4, 1.4, min(vTU.x, 23.4 - vTU.x));
+    c = mix(c, c * vec3(1.1, 1.08, 1.02), kerb * 0.35 * th_vnoise(vTU * vec2(1.3, 0.4)));
+    float seep = smoothstep(0.66, 0.88, th_vnoise(vec2(vTU.x * 2.2 + vTU.y * 0.03, vWPos.y * 0.1)) * 0.8 + n1 * 0.3);
+    c *= 1.0 - 0.28 * seep;
+    keepWet = seep * 0.6;
+  } else {
+    // world frame of this face: T horizontal along it, B = N x T (up a vertical face; into the wall on a top face)
+    vec3 tt = cross(vec3(0.0, 1.0, 0.0), tnN);
+    tnT = dot(tt, tt) > 1e-3 ? normalize(tt) : -uPortalL;
+    tnB = cross(tnN, tnT);
+    tnUseW = 1.0;
+    tuv = vec2(dot(wp, tnT), dot(wp, tnB));
+    vec2 tgx = vec2(dot(wdx, tnT), dot(wdx, tnB)), tgy = vec2(dot(wdy, tnT), dot(wdy, tnB));
+    float n1 = th_fbm(vWPos.xz * 0.3 + vWPos.y * 0.2);
+    vec2 n2p = tuv * vec2(0.9, 0.25) + 3.0;
+    float n2 = th_vnoise(n2p) * 0.65 + th_vnoise(n2p * 2.3 + 1.7) * 0.35;
+    if (wing > 0.5) {
+      float cope = smoothstep(0.55, 0.65, abs(tnN.y));   // the faces themselves are battered ~17 deg (|N.y| ~0.3)
+      if (cope < 0.5) {
+        // ---- coursed rubble masonry, irregular hand-laid joints
+        vec2 wq = tuv + (vec2(th_vnoise(tuv * 2.3), th_vnoise(tuv * 2.3 + 5.2)) - 0.5) * 0.07;
+        const float CH = 0.44, SL = 0.62;
+        float row = floor(wq.y / CH);
+        float yIn = wq.y - row * CH;
+        float xr = wq.x + th_hash(vec2(row, 3.7)) * 1.3;
+        float k = floor(xr / SL);
+        float xIn = xr - k * SL;                               // 0..SL in cell k; joints jittered +-13 cm
+        float Jk = (th_hash(vec2(k, row)) - 0.5) * 0.26, Jk1 = (th_hash(vec2(k + 1.0, row)) - 0.5) * 0.26;
+        float ck = k, jl = Jk, jr = SL + Jk1;
+        if (xIn < Jk) { ck = k - 1.0; jr = Jk; jl = -SL + (th_hash(vec2(k - 1.0, row)) - 0.5) * 0.26; }
+        else if (xIn > SL + Jk1) { ck = k + 1.0; jl = SL + Jk1; jr = 2.0 * SL + (th_hash(vec2(k + 2.0, row)) - 0.5) * 0.26; }
+        float exL = xIn - jl, exR = jr - xIn, eyB = yIn, eyT = CH - yIn;
+        float e = min(min(exL, exR), min(eyB, eyT));
+        vec2 sid = vec2(ck, row);
+        float hs = th_hash(sid + 0.37);
+        // stone face: rock-face scans (lichen_rock 2.0 m / dark_rock_02 2.0 m capture), each block its own crop,
+        // tone and iron staining; weathered granite / gneiss ashlar ~0.12-0.22 dry
+        float lay = th_hash(sid + 6.6) < 0.7 ? 1.0 : 6.0;
+        vec2 suv = (tuv + vec2(th_hash(sid) * 7.0, th_hash(sid + 1.3) * 7.0)) / 2.0;
+        vec3 sa = textureGrad(uAlb, vec3(suv, lay), tgx / 2.0, tgy / 2.0).rgb;
+        vec4 sn = textureGrad(uNrm, vec3(suv, lay), tgx / 2.0, tgy / 2.0);
+        float sl = dot(sa, vec3(0.3, 0.59, 0.11));
+        sa = mix(vec3(sl), sa, 0.4) * (lay < 2.0 ? 3.2 : 4.4) * (0.55 + 0.6 * hs);
+        sa *= mix(vec3(1.0), vec3(1.15, 1.0, 0.8), step(0.75, th_hash(sid + 4.4)));
+        sa *= mix(vec3(1.0), vec3(0.85, 0.88, 0.94), step(0.8, th_hash(sid + 9.1)));
+        vec3 stn = vec3(sn.xy * 2.0 - 1.0, 1.0);
+        // pillowed faces: the block rounds off into the joint (normal tilts toward the nearest edge)
+        // beyond a pixel per joint the pattern is averaged instead of aliasing (grazing views of the flared walls)
+        float far = smoothstep(0.015, 0.05, aaW);
+        float pw = 0.07 + 0.06 * th_hash(sid + 8.8), pa = (0.2 + 0.25 * th_hash(sid + 3.9)) * (1.0 - far);
+        stn.x += pa * ((1.0 - smoothstep(0.0, pw, exR)) - (1.0 - smoothstep(0.0, pw, exL)));
+        stn.y += pa * ((1.0 - smoothstep(0.0, pw, eyT)) - (1.0 - smoothstep(0.0, pw, eyB)));
+        // recessed lime mortar, dirty and wet (albedo ~0.14), 2.5 cm joints
+        float mort = mix(1.0 - smoothstep(0.0125, 0.0125 + aaW * 1.5, e), 0.1, far);
+        vec3 mc = vec3(0.15, 0.145, 0.13) * (0.7 + 0.6 * th_vnoise(tuv * 9.0));
+        c = mix(sa, mc, mort);
+        tnTN = normalize(mix(stn, vec3(0.0, 0.0, 1.0), mort));
+        arm = vec3(mix(sn.a, 0.45, mort), mix(sn.b, 0.85, mort), 0.0);
+        // ---- older weathering: black cyanobacteria streaks from the coping, lichen, moss in the joints
+        float s = vTU.x;                                        // wing-wall UV: (s, height above the wall base)
+        float hgt = 1.6 + 15.2 * pow(clamp((s - 1131.0) / 18.5, 0.0, 1.0), 1.2);
+        float dTop = hgt - vTU.y;
+        float stc = th_vnoise(vec2(tuv.x * 4.0, tuv.y * 0.06)) * 0.65 + th_vnoise(vec2(tuv.x * 13.0, tuv.y * 0.2)) * 0.35;
+        float runs = smoothstep(0.5, 0.78, stc) * (1.0 - smoothstep(1.5, 2.5 + 7.0 * th_vnoise(vec2(tuv.x * 1.7, 2.0)), dTop));
+        float curtain = 1.0 - smoothstep(0.0, 0.5 + 0.9 * th_vnoise(vec2(tuv.x * 1.3, 7.0)), dTop);
+        float blk = max(runs * 0.85, curtain * 0.7);
+        c *= 1.0 - 0.6 * blk;
+        keepWet = max(runs, curtain);
+        float lich = smoothstep(0.62, 0.78, th_vnoise(tuv * 1.6 + 11.0) * 0.65 + th_vnoise(tuv * 3.7 + 2.0) * 0.35) * (1.0 - mort) * smoothstep(0.8, 2.0, vTU.y) * (1.0 - blk);
+        c = mix(c, vec3(0.2, 0.21, 0.17) * (0.8 + 0.4 * th_vnoise(tuv * 20.0)), lich * 0.7);
+        float mv = th_vnoise(tuv * 2.1 + 4.0) * 0.65 + th_vnoise(tuv * 4.9 + 1.0) * 0.35;
+        float mj = mort * smoothstep(0.35, 0.6, mv) * (1.0 - smoothstep(1.5, 4.0 + 3.0 * n2, vTU.y) * 0.6);
+        float mb = (1.0 - smoothstep(0.3, 1.1 + 0.5 * n2, vTU.y)) * smoothstep(0.35, 0.65, mv);
+        mossM = max(mj, mb);
+        c = mix(c, vec3(0.028, 0.042, 0.018) * (0.7 + 0.6 * th_vnoise(tuv * 14.0)), mossM * 0.85);
+        // splash / soil zone at the foot
+        c *= mix(1.0, 0.55, 1.0 - smoothstep(0.2, 0.9 + 0.4 * n2, vTU.y));
+      } else {
+        vec2 uv = tuv / 3.8, gx = tgx / 3.8, gy = tgy / 3.8;
+        // (QA) the sky-facing copings hold the most water: the wettest, darkest concrete on a real portal
+        c = textureGrad(uCast, uv, gx, gy).rgb * 1.3; arm = textureGrad(uCastArm, uv, gx, gy).rgb;
+        tnTN = textureGrad(uCastN, uv, gx, gy).xyz * 2.0 - 1.0;
+        float lum = dot(c, vec3(0.3, 0.59, 0.11));
+        c = mix(vec3(lum), c, 0.4) * (0.75 + 0.4 * n1);
+        // the sloped copings carry the runoff of the slope above: dark wet runs down the fall line, lichen crusts,
+        // moss cushions in the rough patches
+        float fr = smoothstep(0.45, 0.75, th_vnoise(vec2(tuv.x * 3.5, tuv.y * 0.15)) * 0.7 + th_vnoise(vec2(tuv.x * 11.0, tuv.y * 0.4)) * 0.3);
+        c *= 1.0 - 0.35 * fr;
+        float lich = smoothstep(0.6, 0.75, th_fbm(tuv * 1.4 + 7.0)) * (1.0 - fr);
+        c = mix(c, vec3(0.2, 0.21, 0.17) * (0.8 + 0.4 * th_vnoise(tuv * 20.0)), lich * 0.6);
+        mossM = smoothstep(0.3, 0.58, th_fbm(tuv * 0.9 + 3.0));
+        c = mix(c, vec3(0.03, 0.042, 0.02) * (0.7 + 0.6 * th_vnoise(tuv * 12.0)), mossM * 0.85);
+        keepWet = fr * 0.6;
+        rOv = mix(mix(0.62, 0.42, fr * uWet), 0.8, mossM);   // gritty, lichen-crusted, mossy: diffuse, not a sky mirror
+      }
+    } else if (chan > 0.5) {
+      // ---- drainage channel: precast concrete U, water in the bottom
+      vec2 uv = tuv / 1.3;
+      c = textureGrad(uCast, uv, tgx / 1.3, tgy / 1.3).rgb * 1.25; arm = textureGrad(uCastArm, uv, tgx / 1.3, tgy / 1.3).rgb;
+      tnTN = textureGrad(uCastN, uv, tgx / 1.3, tgy / 1.3).xyz * 2.0 - 1.0;
+      float lum = dot(c, vec3(0.3, 0.59, 0.11));
+      c = mix(vec3(lum), c, 0.35) * mix(1.0, 0.6, 1.0 - vMasks.r);
+      // silt and algae in the wetted perimeter
+      float alg = smoothstep(0.4, 0.7, th_fbm(tuv * 3.0)) * (1.0 - vMasks.r);
+      c = mix(c, vec3(0.035, 0.04, 0.025), alg * 0.7);
+      keepWet = 1.0 - vMasks.r;
+      rOv = mix(0.62, 0.4, keepWet);                     // rims: gritty, trafficked by runoff silt
+      if (vMasks.b > 0.5) {
+        // shallow running water: near-black albedo (silt-laden), a smooth surface broken by rain rings
+        c = vec3(0.022, 0.021, 0.018);
+        vec2 rp = tuv * 7.0;
+        vec2 rc = floor(rp);
+        vec2 rf = fract(rp) - 0.5 - (vec2(th_hash(rc), th_hash(rc + 3.1)) - 0.5) * 0.5;
+        float ph = fract(uTTime * 1.3 + th_hash(rc + 7.7));
+        float ring = sin(clamp((length(rf) - ph * 0.45) * 40.0, -3.14, 3.14)) * (1.0 - ph) * step(length(rf), ph * 0.45 + 0.08);
+        tnTN = normalize(vec3(rf * ring * 0.6 + vec2(sin(tuv.x * 3.0 + uTTime * 2.0), 0.0) * 0.03, 1.0));
+        rOv = 0.12;
+        arm = vec3(1.0, 0.12, 0.0);
+      }
+    } else {
+      // ---- headwall, ring, coping, pilasters (cast concrete)
+      float px = -dot(wp, uPortalL), pt = dot(wp, uPortalT), ph = wp.y;
+      float front = smoothstep(0.75, 0.9, -dot(tnN, uPortalT));
+      float rr = ph > ${F(PORTAL.spring)} ? length(vec2(px, ph - ${F(PORTAL.spring)})) : abs(px);
+      // the ring front is the only face this far forward below the coping (terrain.py: collar = opening + 0.85 m
+      // radially from (0, 3.2), so its outer edge is at ~1.165 x the opening's elliptical radius)
+      float ring = front * step(pt, -1.08) * step(ph, 12.0);
+      float er = ph > ${F(PORTAL.spring)} ? length(vec2(px / ${F(PORTAL.ringIn)}, (ph - ${F(PORTAL.spring)}) / 5.3)) : abs(px) / ${F(PORTAL.ringIn)};
+      float face = front * (1.0 - ring) * step(abs(px), ${F(PORTAL.halfW - 0.02)}) * step(ph, ${F(PORTAL.top - 0.02)});
+      // formwork panels 2.7 x 1.35 m: each samples its own crop of the scan (tone steps panel to panel)
+      vec2 pc = floor(vec2(px / 2.7, ph / 1.35));
+      vec2 off = face > 0.5 ? vec2(th_hash(pc + 0.5), th_hash(pc + 7.1)) * 3.0 : vec2(0.0);
+      vec2 uv = (tuv + off) / 2.6, gx = tgx / 2.6, gy = tgy / 2.6;
+      c = textureGrad(uCast, uv, gx, gy).rgb; arm = textureGrad(uCastArm, uv, gx, gy).rgb;
+      tnTN = textureGrad(uCastN, uv, gx, gy).xyz * 2.0 - 1.0;
+      // concrete_wall_006 is a brown scan (mean 0.107/0.083/0.060): neutral cement grey, ~0.21 dry
+      float lum = dot(c, vec3(0.3, 0.59, 0.11));
+      c = mix(vec3(lum), c, 0.3) * vec3(2.36, 2.3, 2.2);
+      c *= mix(1.0, 0.97 + 0.06 * th_hash(pc + 3.3), face);
+      // large-scale mottling: dirt, lime haze, patchy drying
+      c *= 0.82 + 0.3 * n1 + 0.12 * (th_vnoise(tuv * 0.35 + 9.0) - 0.5);
+      if (face > 0.5) {
+        float ax = aaW * 1.3;
+        float jx = abs(fract(px / 2.7 + 0.5) - 0.5) * 2.7, jy = abs(fract(ph / 1.35 + 0.5) - 0.5) * 1.35;
+        float lift = abs(fract(ph / 2.7 + 0.5) - 0.5) * 2.7;
+        float lv = tn_line(jx, 0.004, ax), lh = tn_line(jy, 0.004, ax);
+        float lk = tn_line(lift, 0.007, ax);
+        // joints only where the panels actually leaked grout: patchy along each line
+        float leak = 0.4 + 0.6 * th_vnoise(vec2(px, ph) * 1.7);
+        c *= 1.0 - (0.12 * lv + 0.07 * lh + 0.16 * lk) * leak;
+        // panel-joint fins: a raised grout line with a shadowed side
+        tnTN.x += 0.25 * tn_line(jx, 0.008, ax) * sign(fract(px / 2.7 + 0.5) - 0.5) * leak;
+        tnTN.y += (0.12 * tn_line(jy, 0.008, ax) + 0.3 * lk) * sign(fract(ph / 1.35 + 0.5) - 0.5) * leak;
+        // cold joints leak calcite: pale crusts bleeding down from the lift line in patches
+        float dB = (floor(ph / 2.7) + 1.0) * 2.7 - ph;          // m below the lift joint above
+        float calc = smoothstep(0.6, 0.85, th_vnoise(vec2(px * 2.4, floor(ph / 2.7) * 5.3))) * exp(-dB / (0.2 + 0.5 * th_vnoise(vec2(px * 7.0, 1.0))));
+        calc *= step(ph, ${F(PORTAL.top - 0.4)});
+        c = mix(c, vec3(0.34, 0.34, 0.325), calc * 0.55);
+        // form-tie holes, 0.9 x 1.35 m grid (panel-local x 0.45 / 1.35 / 2.25, y 0.675)
+        vec2 tcell = vec2(0.9, 1.35);
+        vec2 tci = floor(vec2(px, ph) / tcell);
+        vec2 tq = vec2(px, ph) - (tci + 0.5) * tcell;
+        float td = length(tq);
+        float hole = tn_line(td, 0.013, aaW);
+        float plug = tn_line(td, 0.028, aaW) * (1.0 - tn_line(td, 0.013, aaW));
+        float th = th_hash(tci + 2.9);
+        // most ties were plugged with mortar cones (a slightly different grey); a few are open, dark holes
+        c = mix(c, c * (th > 0.2 ? 1.07 : 0.75), plug * 0.7);
+        c = mix(c, c * mix(0.3, 0.9, step(0.2, th)), hole);
+        tnTN.xy += (tq / max(td, 1e-3)) * 0.8 * (tn_line(abs(td - 0.028), 0.004, aaW)) * (th > 0.5 ? 1.0 : -1.0);
+        float below = -tq.y;
+        float rust = step(0.4, th) * step(0.0, below) * tn_line(abs(tq.x), 0.008 + below * 0.05, aaW)
+                   * exp(-below / (0.12 + 0.5 * th_hash(tci + 5.3))) * step(0.02, below + 0.02);
+        c = mix(c, vec3(0.2, 0.085, 0.03), rust * 0.6);
+        // name plate: recessed precast panel with raised letters (canvas: RG normal, B panel / letters)
+        vec2 puv = vec2((px + ${F(PLATE.w / 2)}) / ${F(PLATE.w)}, (ph - ${F(PLATE.y0)}) / ${F(PLATE.h)});
+        float inP = step(0.0, puv.x) * step(puv.x, 1.0) * step(0.0, puv.y) * step(puv.y, 1.0);
+        if (inP > 0.5) {
+          vec4 pl = textureGrad(uPlate, puv, tgx / vec2(${F(PLATE.w)}, ${F(PLATE.h)}), tgy / vec2(${F(PLATE.w)}, ${F(PLATE.h)}));
+          float plP = min(1.0, pl.b * 2.0), plL = max(0.0, pl.b * 2.0 - 1.0);
+          c = mix(c, c * 0.78, plP);                                        // denser, darker precast panel
+          vec3 paint = vec3(0.36, 0.355, 0.33) * (0.55 + 0.45 * th_vnoise(vec2(px, ph) * 11.0));
+          c = mix(c, paint, plL * 0.85);                                     // once-white paint, weathered
+          tnTN.xy += (pl.rg * 2.0 - 1.0) * 1.4;
+        }
+      }
+      if (ring > 0.5) {
+        c *= 1.08;
+        // retroreflective delineator tiles around the arch: 0.5 m red / white along the ring
+        float arc = ph > ${F(PORTAL.spring)} ? atan(px, ph - ${F(PORTAL.spring)}) * 5.45 : sign(px) * (8.56 + ${F(PORTAL.spring)} - ph);
+        float eaa = aaW / 5.0;
+        float band = smoothstep(1.05 - eaa, 1.05, er) * (1.0 - smoothstep(1.115, 1.115 + eaa, er)) * step(0.3, ph);
+        float gap = tn_line(abs(fract(arc / 0.5 + 0.5) - 0.5) * 0.5, 0.012, aaW);   // tile gaps
+        float seg = step(0.5, fract(arc / 1.0));
+        // hazard boards on the vertical sides: 45 deg red/white stripes over the full ring width
+        float side = step(ph, ${F(PORTAL.spring)}) * step(0.3, ph) * smoothstep(${F(PORTAL.ringIn)} + 0.05, ${F(PORTAL.ringIn)} + 0.05 + aaW, rr);
+        float diag = step(0.5, fract((ph + abs(px)) / 0.4));
+        float isStrip = max(band, side);
+        float red = mix(seg, diag, side);
+        vec3 sc = mix(vec3(0.46, 0.46, 0.44), vec3(0.24, 0.028, 0.02), red);
+        sc *= 0.62 + 0.38 * th_vnoise(vec2(arc, ph) * 6.0);                  // road film and grime
+        sc = mix(sc, sc * vec3(0.6, 0.55, 0.5), smoothstep(0.55, 0.8, th_vnoise(vec2(arc * 0.8, ph * 3.0))));
+        sc *= 1.0 - 0.5 * (1.0 - smoothstep(0.3, 1.2, ph));                 // spray at the foot
+        c = mix(c, sc, isStrip * (1.0 - gap));
+        rOv = mix(rOv, 0.3, isStrip);
+        tnTN = mix(tnTN, vec3(0.0, 0.0, 1.0), isStrip * 0.8);
+      }
+      // coping top / pilaster tops: sky-facing, wettest, mossy
+      float top = smoothstep(0.6, 0.8, tnN.y);
+      if (top > 0.01) mossM = top * smoothstep(0.45, 0.7, th_fbm(tuv * 1.1 + 5.0));
+      // runoff from the coping: a dark drip curtain with a ragged lower edge, then narrow biofilm runs
+      float dTop = ${F(PORTAL.top)} - ph;
+      float curtain = (1.0 - smoothstep(0.0, 0.8 + 2.4 * th_vnoise(vec2(px * 0.7, 3.1)) + 1.6 * th_vnoise(vec2(px * 3.1, 1.7)), dTop)) * step(0.0, dTop);
+      float stc = th_vnoise(vec2(px * 5.0, ph * 0.07)) * 0.6 + th_vnoise(vec2(px * 16.0, ph * 0.22)) * 0.4;
+      float sLen = 4.0 + 16.0 * th_vnoise(vec2(px * 1.9, 0.5));
+      float runs = smoothstep(0.48, 0.78, stc) * (1.0 - smoothstep(sLen * 0.5, sLen, dTop)) * step(0.0, dTop);
+      // water shed around the ring drips off its underside at the springing: dark wet fans beside the opening
+      float fan = front * (1.0 - ring) * (1.0 - smoothstep(0.0, 1.2, abs(abs(px) - 6.3))) * (1.0 - smoothstep(1.0, 3.5, ph));
+      float blk = max(max(curtain * 0.75, runs), fan * 0.6) * (1.0 - top);
+      c *= 1.0 - 0.62 * blk;
+      // (sky-facing ledges: gritty, not a sky mirror; a thin glossy ledge aliases into a dotted highlight)
+      keepWet = max(blk, top * 0.35);
+      // splash zone and moss / algae at the foot
+      float base = 1.0 - smoothstep(0.15, 1.3 + 0.6 * n2, ph);
+      c = mix(c, c * vec3(0.45, 0.46, 0.4), base * 0.8);
+      mossM = max(mossM, base * smoothstep(0.42, 0.68, n2) * (1.0 - ring));
+      c = mix(c, vec3(0.03, 0.045, 0.02) * (0.7 + 0.6 * th_vnoise(tuv * 12.0)), mossM * 0.75);
+    }
+  }
+  float wet = uWet * (1.0 - smoothstep(${TUNNEL.s0 - 1}.0, ${TUNNEL.s0 + 6}.0, vTU.y) * tube);
+  // porous concrete / mortar darkens ~45 % when saturated, the granite blocks ~30 %
+  c *= mix(1.0, mix(0.55, 0.7, wing), wet);
+  tnRough = mix(arm.g, 0.46, wet * 0.75);
+  tnRough = mix(tnRough, 0.3, keepWet * wet);
+  tnRough = mix(tnRough, 0.72, mossM);
+  if (rOv >= 0.0) tnRough = rOv;
+  tnTN = normalize(tnTN);
+  if (tnUseW > 0.5) tnNWg = normalize(tnT * tnTN.x + tnB * tnTN.y + tnN * tnTN.z);
+  // outside the tube the 30 m Cycles AO over-darkens the portal slot (no bounce light): floor it
+  tnAO = chan > 0.5 ? arm.r * vMasks.r : arm.r * mix(mix(0.55, 1.0, vMasks.r), vMasks.r, tube);
+  diffuseColor.rgb = c;
+  // daylight left at this fragment (uv.y = s in the tube and on the end cap; headwall / wings are outside)
+  tnIn = smoothstep(${TUNNEL.s0 - 0.5}, ${TUNNEL.s0 + 14}.0, vTU.y) * tube;
+  tnDay = mix(1.0, 0.015, tnIn);
+}`;
+
 /**
- * Tunnel material. Headwall + tube lining: cast-in-place concrete (concrete_wall_006: form-tie holes, pour
- * lines) with rain streaks from the coping, a dark splash zone and moss at the base, efflorescence; the wing
- * walls are stone-faced (precast_concrete_wall at a real block scale). COLOR_0: R = AO, G = grime (tube kerb) /
- * part id (0.4 headwall, 0.45 wing walls), A = 1 in the tube.
+ * Name plate texture, drawn procedurally: RG = tangent-space normal (x right, y up), B = 0.5 * recessed panel +
+ * 0.5 * raised letters, A = 1. Fictional name; bilingual as in South Tyrol / Ticino.
+ */
+function makePlateTexture() {
+  const W = 1024, H = Math.round(1024 * PLATE.h / PLATE.w);
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  const hm = (draw, blur) => {
+    g.save(); g.filter = 'none'; g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+    g.filter = blur ? `blur(${blur}px)` : 'none';
+    draw(); g.restore();
+    const d = g.getImageData(0, 0, W, H).data, o = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) o[i] = d[i * 4] / 255;
+    return o;
+  };
+  const px = W / PLATE.w;   // pixels per metre
+  const inset = 0.07 * px;
+  const panel = hm(() => { g.fillStyle = '#fff'; g.fillRect(inset, inset, W - 2 * inset, H - 2 * inset); }, 1.2);
+  const text = (fill) => {
+    g.fillStyle = fill; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+    const f1 = Math.round(0.5 * px), f2 = Math.round(0.34 * px);
+    g.font = `700 ${f1}px "DIN Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif`;
+    try { g.letterSpacing = `${Math.round(0.06 * px)}px`; } catch { /* older canvas */ }
+    g.fillText('GALLERIA ROCCANERA', W / 2, H * 0.56);
+    g.font = `600 ${f2}px "DIN Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif`;
+    try { g.letterSpacing = `${Math.round(0.08 * px)}px`; } catch { /* older canvas */ }
+    g.fillText('TUNNEL  ·  1961', W / 2, H * 0.86);
+  };
+  const letters = hm(() => text('#fff'), 1.4);
+  const out = g.createImageData(W, H), o = out.data;
+  // height: frame 0.02 m proud, panel recessed 0.02 m, letters 0.015 m proud of the panel
+  const hgt = (i) => (1 - panel[i]) * 0.02 + letters[i] * 0.015;
+  const k = px * 0.5;   // slope per pixel difference, in metres per metre
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const xl = y * W + Math.max(0, x - 1), xr = y * W + Math.min(W - 1, x + 1);
+      const yu = Math.max(0, y - 1) * W + x, yd = Math.min(H - 1, y + 1) * W + x;
+      const dx = (hgt(xr) - hgt(xl)) * k, dy = (hgt(yu) - hgt(yd)) * k;   // canvas y runs down, texture v up
+      let nx = -dx, ny = -dy;
+      const l = Math.hypot(nx, ny, 1); nx /= l; ny /= l;
+      o[i * 4] = Math.round((nx * 0.5 + 0.5) * 255);
+      o[i * 4 + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+      // B packs both masks (letters only occur inside the panel): 0.5 * panel + 0.5 * letters. A stays opaque:
+      // canvas 2D is premultiplied, so A = 0 texels would lose their normal (RG) on readback / upload
+      o[i * 4 + 2] = Math.round((0.5 * panel[i] + 0.5 * Math.min(1, letters[i] * 1.6)) * 255);
+      o[i * 4 + 3] = 255;
+    }
+  }
+  g.putImageData(out, 0, 0);
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.NoColorSpace;
+  t.premultiplyAlpha = false;
+  t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  t.anisotropy = 8;
+  t.generateMipmaps = true;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.needsUpdate = true;
+  return t;
+}
+
+/**
+ * Tunnel material: portal headwall + ring + coping (cast concrete in formwork panels, tie holes, calcite and rust,
+ * runoff streaks, a name plate, delineator tiles), wing walls (older coursed rubble masonry), the drainage channel
+ * (part id 0.3) and the tube lining. COLOR_0: R = AO, G = grime (tube kerb) / part id (0.3 channel, 0.4 headwall,
+ * 0.45 wing walls), B = water (channel), A = 1 in the tube.
  */
 export async function createTunnelMaterial(ctx) {
-  const [tex, cast] = await Promise.all([ctx.assets.pbr('precast_concrete_wall'), ctx.assets.pbr('concrete_wall_006')]);
+  const [cast, arr] = await Promise.all([ctx.assets.pbr('concrete_wall_006'), loadTerrainArrays(ctx)]);
   const m = new THREE.MeshStandardMaterial({ roughness: 1, metalness: 0, color: 0xffffff });
   m.normalMap = cast.normalMap;
+  let plate = null;
+  try { plate = makePlateTexture(); } catch (e) { console.warn('[tunnel] name plate', e); }
+  if (!plate) { plate = new THREE.DataTexture(new Uint8Array([128, 128, 0, 255]), 1, 1); plate.needsUpdate = true; }
+  const road = ctx.road;
   const uniforms = {
-    uCon: { value: tex.map }, uConN: { value: tex.normalMap }, uConArm: { value: tex.armMap },
     uCast: { value: cast.map }, uCastN: { value: cast.normalMap }, uCastArm: { value: cast.armMap },
+    uAlb: { value: arr.alb }, uNrm: { value: arr.nrm }, uPlate: { value: plate },
     uWet: { value: ctx.env?.wetness ?? 0.75 },
-    uPortalY: { value: ctx.road ? ctx.road.pointAt(TUNNEL.s0).y : 0 },
-    uPortalP: { value: ctx.road ? ctx.road.pointAt(TUNNEL.s0) : new THREE.Vector3() },
+    uTTime: { value: 0 },
+    uPortalY: { value: road ? road.pointAt(TUNNEL.s0).y : 0 },
+    uPortalP: { value: road ? road.pointAt(TUNNEL.s0) : new THREE.Vector3() },
+    uPortalL: { value: road ? road.leftAt(TUNNEL.s0) : new THREE.Vector3(0, 0, -1) },
+    uPortalT: { value: road ? (() => { const t = road.tangentAt(TUNNEL.s0); t.y = 0; return t.normalize(); })() : new THREE.Vector3(1, 0, 0) },
     ...tunnelUniforms(ctx),
   };
-  const s0 = TUNNEL.s0;
   m.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, uniforms);
     sh.vertexShader = sh.vertexShader
@@ -575,97 +951,7 @@ export async function createTunnelMaterial(ctx) {
       .replace('#include <fog_vertex>', '#include <fog_vertex>\n vTU = uv; vMasks = masks; vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', '#include <common>\n' + TUN_FRAG_PARS)
-      .replace('#include <map_fragment>', `{
-        float tube = step(0.5, vMasks.a);
-        float wing = (1.0 - tube) * step(0.425, vMasks.g) * step(vMasks.g, 0.6);
-        float h = vWPos.y - uPortalY;                       // height above the portal road level (m)
-        vec3 c; vec3 arm;
-        vec2 tuv = vTU;
-        // (derivatives in uniform control flow: inside the varying-dependent branch they are undefined)
-        vec3 wdx = dFdx(vWPos), wdy = dFdy(vWPos);
-        if (wing > 0.5) {
-          // (QA) the wing walls' mesh UVs are sheared on the sloped copings (the block pattern smeared diagonally
-          // across them). Project in world space instead, in the face's own frame: T horizontal along the face,
-          // B = N x T (up a vertical face, down the fall line of a slope), so no face ever stretches. The copings
-          // (steep slopes and tops, |N.y| > 0.6) are poured concrete, as on a real portal, not stone facing.
-          // interpolated vertex normal, not the derivative one: fp32 derivatives at x ~1100 m jitter ~1 % per pixel
-          // quad, which dot(p, T) turns into metres of texture jitter (noise instead of blocks). Positions are
-          // taken relative to the portal for the same reason.
-          tnN = normalize((vec4(vNormal, 0.0) * viewMatrix).xyz);
-          vec3 tt = cross(vec3(0.0, 1.0, 0.0), tnN);
-          tnT = dot(tt, tt) > 1e-3 ? normalize(tt) : vec3(1.0, 0.0, 0.0);
-          tnB = cross(tnN, tnT);
-          tnUseW = 1.0;
-          vec3 wp = vWPos - uPortalP;
-          tuv = vec2(dot(wp, tnT), dot(wp, tnB));
-          float cope = smoothstep(0.55, 0.65, abs(tnN.y));   // the faces themselves are battered ~17 deg (|N.y| ~0.3)
-          // explicit gradients: implicit ones are undefined inside this varying-dependent branch (coarse mip)
-          vec2 tgx = vec2(dot(wdx, tnT), dot(wdx, tnB)), tgy = vec2(dot(wdy, tnT), dot(wdy, tnB));
-          if (cope < 0.5) {
-            vec2 uv = tuv / 3.4, gx = tgx / 3.4, gy = tgy / 3.4;
-            c = textureGrad(uCon, uv, gx, gy).rgb; arm = textureGrad(uConArm, uv, gx, gy).rgb;
-            tnTN = textureGrad(uConN, uv, gx, gy).xyz * 2.0 - 1.0;
-            c = mix(c, vec3(dot(c, vec3(0.3, 0.59, 0.11))), 0.35) * vec3(0.78, 0.78, 0.8);
-          } else {
-            vec2 uv = tuv / 3.8, gx = tgx / 3.8, gy = tgy / 3.8;
-            // (QA) 1.25 -> 0.85: the sky-facing copings hold the most water (the wettest, darkest concrete on a real
-            // portal); at 1.25 the sloped wing-wall tops read as pale, flat untextured slabs
-            c = textureGrad(uCast, uv, gx, gy).rgb * 0.85; arm = textureGrad(uCastArm, uv, gx, gy).rgb;
-            tnTN = textureGrad(uCastN, uv, gx, gy).xyz * 2.0 - 1.0;
-          }
-        } else {
-          // cast concrete: rotate the scan so its pour lines run horizontally on the walls
-          vec2 uv = vTU / mix(3.8, 4.4, tube);
-          c = texture(uCast, uv).rgb; arm = texture(uCastArm, uv).rgb;
-          tnTN = texture(uCastN, uv).xyz * 2.0 - 1.0;
-          c *= mix(1.9, 1.3, tube);
-        }
-        float n1 = th_fbm(vWPos.xz * 0.3 + vWPos.y * 0.2);
-        float n2 = th_fbm(tuv * vec2(0.9, 0.25) + 3.0);
-        c *= 0.88 + 0.24 * n1;
-        if (tube > 0.5) {
-          float jd = abs(fract((vTU.y - ${s0}.0) / 11.0 + 0.5) - 0.5) * 11.0;      // m to the nearest ring joint
-          float fw = fwidth(vTU.y) + 0.004;
-          float joint = 1.0 - smoothstep(0.012, 0.03 + fw, jd);
-          c *= 1.0 - 0.35 * joint * (0.6 + 0.4 * th_vnoise(vTU * vec2(1.5, 0.3)));
-          tnTN = normalize(mix(tnTN, vec3(sign(fract((vTU.y - ${s0}.0) / 11.0 + 0.5) - 0.5), 0.0, 0.6), joint * 0.6));
-          // exhaust soot toward the crown, blotchy
-          float crown = smoothstep(6.5, 9.5, vTU.x) * (1.0 - smoothstep(14.0, 17.0, vTU.x)); // profile arc ~23.4 m, crown ~11.7
-          c *= 1.0 - 0.45 * crown * (0.6 + 0.4 * th_vnoise(vTU * vec2(0.8, 0.15)));
-          // road spray grime on the lower walls, tide marks / efflorescence near the kerb
-          c = mix(c, c * vec3(0.4, 0.38, 0.35), vMasks.g * (0.6 + 0.4 * n1));
-          float kerb = 1.0 - smoothstep(0.4, 1.4, min(vTU.x, 23.4 - vTU.x));
-          c = mix(c, c * vec3(1.1, 1.08, 1.02), kerb * 0.35 * th_vnoise(vTU * vec2(1.3, 0.4)));
-        } else {
-          // rain streaks washing down from the coping / top: long, vertical, uneven
-          float st = smoothstep(0.5, 0.85, th_vnoise(vec2(tuv.x * 1.6, h * 0.06)) * 0.7 + th_vnoise(vec2(tuv.x * 5.5, h * 0.22)) * 0.35);
-          float top = mix(0.55, 1.0, smoothstep(6.0, 15.5, h));
-          c *= 1.0 - 0.42 * st * top;
-          // white efflorescence bleeding from the pour joints
-          float eff = smoothstep(0.7, 0.95, th_vnoise(vec2(tuv.x * 3.0, h * 0.5))) * smoothstep(0.3, 0.8, fract(h / 2.2 + 0.1));
-          c = mix(c, vec3(0.62, 0.61, 0.58), eff * 0.25 * (1.0 - wing));
-          // splash zone + moss / algae at the base
-          float base = 1.0 - smoothstep(0.2, 1.6 + 0.6 * n2, h);
-          c = mix(c, c * vec3(0.42, 0.43, 0.36), base * 0.8);
-          float moss = base * smoothstep(0.45, 0.7, n2);
-          c = mix(c, vec3(0.05, 0.065, 0.03), moss * 0.6);
-          tnTN.xy *= 1.0 - 0.3 * moss;
-        }
-        // seepage through the rock above: dark wet trails
-        float seep = smoothstep(0.66, 0.88, th_vnoise(vec2(tuv.x * 2.2 + tuv.y * 0.03, vWPos.y * 0.1)) * 0.8 + n1 * 0.3);
-        c *= 1.0 - 0.28 * seep;
-        float wet = uWet * (1.0 - smoothstep(${s0 - 1}.0, ${s0 + 6}.0, vTU.y) * tube);
-        c *= mix(1.0, 0.72, wet);
-        tnRough = mix(arm.g, 0.4, max(wet * 0.8, seep * 0.6));
-        tnTN = normalize(tnTN);
-        if (tnUseW > 0.5) tnNWg = normalize(tnT * tnTN.x + tnB * tnTN.y + tnN * tnTN.z);
-        // outside the tube the 30 m Cycles AO over-darkens the portal slot (no bounce light): floor it
-        tnAO = arm.r * mix(mix(0.55, 1.0, vMasks.r), vMasks.r, tube);
-        diffuseColor.rgb = c;
-        // daylight left at this fragment (uv.y = s in the tube and on the end cap; headwall / wings are outside)
-        tnIn = smoothstep(${s0 - 0.5}, ${s0 + 14}.0, vTU.y) * tube;
-        tnDay = mix(1.0, 0.015, tnIn);
-      }`)
+      .replace('#include <map_fragment>', TUN_MAP)
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = tnRough;')
       .replace('#include <normal_fragment_maps>', 'normal = tnUseW > 0.5 ? normalize( ( viewMatrix * vec4( tnNWg, 0.0 ) ).xyz ) : normalize( tbn * tnTN );')
       .replace('#include <lights_fragment_begin>', lightsChunk('tnDay'))
@@ -681,8 +967,11 @@ export async function createTunnelMaterial(ctx) {
         }
       }`);
   };
-  m.customProgramCacheKey = () => 'tunnel-v4';
+  m.customProgramCacheKey = () => 'tunnel-v5';
   m.userData.uniforms = uniforms;
-  m.userData.update = () => { uniforms.uWet.value = ctx.env?.wetness ?? uniforms.uWet.value; };
+  m.userData.update = (dt = 0) => {
+    uniforms.uWet.value = ctx.env?.wetness ?? uniforms.uWet.value;
+    uniforms.uTTime.value = (uniforms.uTTime.value + (dt || 0)) % 1000;
+  };
   return m;
 }
