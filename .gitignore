@@ -5,3 +5,4 @@ raw_assets
 .vercel
 .DS_Store
 tools/blender/__pycache__
+.env*
