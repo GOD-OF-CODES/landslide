@@ -592,7 +592,9 @@ function createGrassCardMaterial(map, normalMap, radius) {
 /** Ground-flora card material (bilberry, coltsfoot, butterbur): atlas albedo + normal, alpha test, flutter, wet sheen. */
 function createFloraMaterial(map, normalMap, radius, opts = {}) {
   const m = new THREE.MeshStandardMaterial({
-    map, normalMap: normalMap || null, side: THREE.DoubleSide, alphaTest: opts.alphaTest ?? 0.45,
+    // alpha test 0.4 (was 0.45): the shared needle / leaf atlas now carries a coverage-preserving mip chain built for
+    // the 0.42 foliage test (render/impostor.js applyCoverageMips); 0.4 keeps the flora as full as with the old box mips
+    map, normalMap: normalMap || null, side: THREE.DoubleSide, alphaTest: opts.alphaTest ?? 0.4,
     roughness: opts.roughness ?? 0.7, metalness: 0, normalScale: new THREE.Vector2(0.7, 0.7), envMapIntensity: 0.55,
   });
   if (opts.color) m.color.copy(opts.color);
@@ -673,7 +675,7 @@ export class GrassField {
       this.bilberry = this._mkInst(buildBilberry(31), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.65, color: new THREE.Color(0.8, 0.8, 0.75) }), 2600, 'bilberry');
       this.coltsfoot = this._mkInst(buildForb(41, 'coltsfoot'), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.8, wetRough: 0.55, color: new THREE.Color(0.58, 0.6, 0.58) }), 900, 'coltsfoot');
       this.butterbur = this._mkInst(buildForb(43, 'butterbur'), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.7, wetRough: 0.5, color: new THREE.Color(0.7, 0.74, 0.66) }), 400, 'butterbur');
-      const lm = createFloraMaterial(opts.foliageMap, opts.foliageNormal, Math.min(R, 30), { roughness: 0.85, wetRough: 0.55, alphaTest: 0.5,
+      const lm = createFloraMaterial(opts.foliageMap, opts.foliageNormal, Math.min(R, 30), { roughness: 0.85, wetRough: 0.55, alphaTest: 0.45,
         color: new THREE.Color(0.62, 0.62, 0.52) });
       lm.polygonOffset = true; lm.polygonOffsetFactor = -2; lm.polygonOffsetUnits = -2; lm.side = THREE.FrontSide;
       this.litter = this._mkInst(buildLitterQuad(), lm, 1200, 'litter');

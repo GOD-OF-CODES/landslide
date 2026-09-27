@@ -92,6 +92,8 @@ export default class Terrain {
       catch (e) { console.warn('[terrain] portal collar', e); }
       try { const seal = this._portalRingSeal(matTunnel, root); if (seal) root.add(seal); }
       catch (e) { console.warn('[terrain] portal ring seal', e); }
+      try { const ul = this._tunnelUnderlay(root); if (ul) root.add(ul); }
+      catch (e) { console.warn('[terrain] tunnel underlay', e); }
       // the portal drainage channel needs ground heights (Rapier queries work after the first step): built in update()
       this._chanPending = true; this._matTunnel = matTunnel;
     }
@@ -827,6 +829,43 @@ export default class Terrain {
     const mesh = new THREE.Mesh(geo, mat);
     mesh.name = 'tunnel_portal_collar';
     mesh.receiveShadow = true; mesh.castShadow = false;
+    mesh.matrixAutoUpdate = false;
+    return mesh;
+  }
+
+  /**
+   * (QA) Inside the tube nothing lies under the road strip: its edge (d = +-3.049, 6 cm below the crown, 0.5 m
+   * vertices) meets the tunnel kerb face (d = +-3.05, 1 m vertices) along T-junction cracks, and the road's skirt
+   * faces away from the camera (culled), so the sky dome showed through as a row of single-pixel blue-white sparkles
+   * along the foot of both kerbs. A dark unlit strip 25 cm below the centreline, wide enough to catch grazing rays
+   * that run on under the kerb and walkway (d = +-5.2), closes every such crack; it is hidden everywhere else.
+   */
+  _tunnelUnderlay(root) {
+    const road = this.ctx.road;
+    if (!road) return null;
+    const s0 = TUNNEL.s0 - 1.0, s1 = TUNNEL.s1, W = 5.2, DY = -0.25;
+    const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
+    const pos = [], idx = [], c = new THREE.Vector3(), l = new THREE.Vector3(), w = new THREE.Vector3();
+    const n = Math.ceil(s1 - s0);
+    for (let k = 0; k <= n; k++) {
+      const s = s0 + ((s1 - s0) * k) / n;
+      road.pointAt(s, c); road.leftAt(s, l);
+      for (const d of [W, -W]) {
+        w.copy(c).addScaledVector(l, d); w.y = c.y + DY;
+        w.applyMatrix4(inv);
+        pos.push(w.x, w.y, w.z);
+      }
+      if (k) { const a = (k - 1) * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setIndex(idx);
+    geo.computeBoundingSphere();
+    const mat = new THREE.MeshBasicMaterial({ color: 0x0b0907, side: THREE.DoubleSide });
+    this.materials?.push(mat);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.name = 'tunnel_underlay';
+    mesh.castShadow = false; mesh.receiveShadow = false;
     mesh.matrixAutoUpdate = false;
     return mesh;
   }

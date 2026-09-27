@@ -157,8 +157,8 @@ function lodVertexCode(depthPass) {
   float tr_dist = distance(uCamPos, tr_ipos);
   // x: fill fraction of this LOD (inner hand-over); y: fraction of its cards removed (outer hand-over). Both LODs of a
   // hand-over share one band parameter t: the incoming one fills linearly (t) while the outgoing one keeps
-  // (1 - t) / (1 - k t), which holds the union coverage of the two overlapping silhouettes constant (k = overlap area /
-  // single-LOD area, measured with scratch/fix_dither/coverage.mjs): no thickening or thinning across the band
+  // (1 - t) / (1 - k t), which holds the union coverage of the two overlapping silhouettes about constant (k tuned
+  // per hand-over with scratch/fix_dither/coverage.mjs, uLodK): no thickening or thinning across the band
   float tr_tout = smoothstep(uLod.z, uLod.w, tr_dist);
   vLodT = tr_tout;
   vLod = vec2(uLod.y > 0.0 ? smoothstep(uLod.x, uLod.y, tr_dist) : 1.0, 1.0 - (1.0 - tr_tout) / max(1.0 - uLodK.x * tr_tout, 1e-3));
@@ -206,14 +206,16 @@ const GLSL_ALPHA_MIP = /* glsl */`
 // vanishes or opens as a hard, fully bright pixel (the white "sparkles" against the misty sky). Each alpha-tested
 // material therefore has a blended twin drawn right after the opaque pass: depth test LESS against the opaque depth,
 // no depth write, it shades only the texels the opaque pass rejected (coverage between cut * FRINGE_LO and cut) and
-// blends them with opacity coverage / cut, so opacity is continuous across the cut. A real lens + sensor never renders
+// blends them with an opacity ramping from 0 to 1 over that range (continuous at both thresholds). A real lens + sensor never renders
 // a partially covered pixel as all-or-nothing either (optical low-pass: MTF50 ~0.3 cycles/px for a phone / dashcam).
-const FRINGE_LO = 0.3;
-function glslCoverage(cut, fringe, fadeDist = 0, fadeVar = '') {
+const FRINGE_LO = 0.15;   // foliage; the impostor atlas (soft, wide low-alpha skirts) uses 0.3
+function glslCoverage(cut, fringe, fadeDist = 0, fadeVar = '', loFrac = FRINGE_LO) {
   if (!fringe) return '#include <alphatest_fragment>\n';
   let fade = fadeDist ? ` * (1.0 - smoothstep(${(fadeDist * 0.6).toFixed(1)}, ${fadeDist.toFixed(1)}, length(vViewPosition)))` : '';
   if (fadeVar) fade += ` * ${fadeVar}`;
-  return `{ float tr_cov = diffuseColor.a; if (tr_cov >= ${cut.toFixed(4)} || tr_cov < ${(cut * FRINGE_LO).toFixed(4)}) discard; diffuseColor.a = tr_cov / ${cut.toFixed(4)}${fade}; }\n`;
+  // opacity ramps 0 -> 1 from cut * FRINGE_LO to cut: continuous at both ends (no visible step at either threshold)
+  const lo = cut * loFrac;
+  return `{ float tr_cov = diffuseColor.a; if (tr_cov >= ${cut.toFixed(4)} || tr_cov <= ${lo.toFixed(4)}) discard; diffuseColor.a = (tr_cov - ${lo.toFixed(4)}) / ${(cut - lo).toFixed(4)}${fade}; }\n`;
 }
 // The fringe's clip-space depth is pushed back along the view ray by `push` metres (screen position unchanged), so
 // with depth test LESS it only shades where the opaque background lies more than `push` behind it: holes through the
@@ -311,7 +313,7 @@ function glslTranslucency(mask, shell) {
 }
 
 /**
- * Foliage card material (alpha tested, double sided, bent normals, baked crown AO, wind, LOD dither).
+ * Foliage card material (alpha tested, double sided, bent normals, baked crown AO, wind, LOD card thinning).
  * opts: {map, normalMap, lod: Vector4 uniform value (shared per LOD), alphaTest}
  */
 export function createFoliageMaterial(opts) {
@@ -401,7 +403,7 @@ export function createFoliageMaterial(opts) {
   return m;
 }
 
-/** Bark material: albedo + normal + ARM (AO/rough), wetness streaks, wind, LOD dither. */
+/** Bark material: albedo + normal + ARM (AO/rough), wetness streaks, wind, LOD switch. */
 export function createBarkMaterial(opts) {
   const m = new THREE.MeshStandardMaterial({
     map: opts.map, normalMap: opts.normalMap || null, roughnessMap: opts.arm || null, aoMap: opts.arm || null,
@@ -450,7 +452,7 @@ export function createBarkMaterial(opts) {
   return m;
 }
 
-/** Shadow depth material for instanced trees (wind + alpha test; no dither). */
+/** Shadow depth material for instanced trees (wind + alpha test; no LOD selection). */
 export function createTreeDepthMaterial(map, alphaTest = 0.42) {
   const m = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: map || null, alphaTest: map ? alphaTest : 0 });
   m.onBeforeCompile = (sh) => {
@@ -556,8 +558,8 @@ function createImpostorMaterial(meta, albedo, normal, base = null) {
         transformed = cameraPosition + (transformed - cameraPosition) * (max(dist - pull, dist * 0.5) / dist);
         float hh = max(0.0, V.w * s + hq);
         transformed += tr_wind(hh, 0.0, tr_hash12(iPos.xz * 0.173), 0.0, center);
-        // LOD distance measured exactly like the mesh LODs (main camera -> trunk base) so the complementary dither
-        // thresholds line up pixel for pixel across the mesh/impostor band
+        // LOD distance measured exactly like the mesh LODs (main camera -> trunk base) so the impostor fill and the
+        // mesh LOD1 hand-over share one band parameter (see lodVertexCode)
         float lodDist = distance(uCamPos, iPos.xyz);
         vLod = vec2(smoothstep(uLod.x, uLod.y, lodDist), smoothstep(uLod.z, uLod.w, lodDist));
         if (vLod.x <= 0.0 || vLod.y >= 1.0) transformed = vec3(0.0, -1e5, 0.0); // fully handled by meshes / beyond range
@@ -584,7 +586,7 @@ function createImpostorMaterial(meta, albedo, normal, base = null) {
         diffuseColor.rgb *= mix(vec3(1.0), tint, uTintAmt) * uFolTint * uImpBright;
         diffuseColor.rgb *= mix(1.0, 0.92, uWet);
       `)
-      .replace('#include <alphatest_fragment>', glslCoverage(IMP_CUTOFF, fringe, IMP_FRINGE_DIST) + /* glsl */`
+      .replace('#include <alphatest_fragment>', glslCoverage(IMP_CUTOFF, fringe, IMP_FRINGE_DIST, '', 0.3) + /* glsl */`
         if (vLod.x < 1.0 || vLod.y > 0.0) {
           // LOD crossfade in branch-sized clumps, not a per-pixel screen-door: tree-locked value noise in quad space
           // (~1 m and ~0.4 m cells), remapped to a near-uniform distribution (smoothstep ~ normal CDF) and weighted
@@ -682,7 +684,8 @@ for (let i = 0; i <= 4096; i++) { const c = i / 4096; _l2s[i] = Math.round(255 *
  *    alpha boost) only approximated this and was paired with a negative LOD bias that sampled sub-pixel gaps;
  *  - colour is averaged with alpha weights (premultiplied, in linear light for sRGB maps) and pushed into the empty
  *    texels of every level (push-pull dilation), so a filtered edge never picks up the colour of empty texels.
- * Level 0 stays the original image (a canvas round trip zeroes the colour of alpha = 0 texels). Runs once at load
+ * Level 0 stays the original image where possible (a canvas round trip zeroes the colour of alpha = 0 texels; an
+ * ImageBitmap is replaced, see below). Runs once at load
  * (~0.1-0.3 s for a 2048^2 atlas). Returns the per-level alpha scales, or null if the image cannot be read.
  */
 export function applyCoverageMips(tex, cutoff, { srgb = true } = {}) {
@@ -757,7 +760,24 @@ export function applyCoverageMips(tex, cutoff, { srgb = true } = {}) {
       }
     }
   }
-  const mips = [img];
+  // Level 0. An ImageBitmap (GLTFLoader) must not stay the texture's image: three.js skips the UNPACK_FLIP_Y /
+  // PREMULTIPLY / COLORSPACE pixelStorei calls for ImageBitmap textures, so the ImageData levels would be uploaded with
+  // whatever unpack state the previous texture left (measured: levels >= 1 came out vertically flipped). It is
+  // replaced by an ImageData copy whose empty texels get the dilated colour of level 1 (the canvas zeroed them).
+  let level0 = img;
+  if (typeof ImageBitmap !== 'undefined' && img instanceof ImageBitmap) {
+    const d0 = new Uint8ClampedArray(src.length), L1 = levels[0];
+    d0.set(src);
+    for (let i = 0; i < W * H; i++) {
+      if (src[i * 4 + 3] !== 0 || !L1) continue;
+      const x = Math.min(L1.w - 1, (i % W) >> 1), y = Math.min(L1.h - 1, ((i / W) | 0) >> 1), j = (y * L1.w + x) * 3;
+      for (let c = 0; c < 3; c++) { const v = Math.min(1, Math.max(0, L1.U[j + c])); d0[i * 4 + c] = dec ? _l2s[(v * 4096) | 0] : Math.round(v * 255); }
+    }
+    level0 = new ImageData(d0, W, H);
+    tex.image = level0;
+    img.close?.();
+  }
+  const mips = [level0];
   levels.forEach((L, li) => {
     const n = L.w * L.h, d = new Uint8ClampedArray(n * 4), s = scales[li];
     for (let i = 0; i < n; i++) {
@@ -873,15 +893,14 @@ export class TreeField {
     this.band0 = 3.5;
     this.band1 = Math.max(6, this.meshDist * 0.09);
     // blended coverage fringes (see glslCoverage): ultra / high on foliage + impostors, medium on impostors only
-    // (cheap), low none. Debug: ?fringe=all|imp|none (?nofringe = none).
+    // (cheap), low none. Debug: ?fringe=all|near|imp|none (?nofringe = none).
     const sp = new URLSearchParams(globalThis.location?.search || '');
     const fr = sp.has('nofringe') ? 'none' : (sp.get('fringe') || (q.key === 'low' ? 'none' : q.key === 'medium' ? 'imp' : 'all'));
-    this.fringe = fr === 'all' || fr === 'full';      // mesh foliage
+    this.fringe = fr === 'all' || fr === 'near';      // mesh foliage
     this.impFringeOn = this.fringe || fr === 'imp';   // impostors
-    // mesh-foliage fringe on every mesh LOD on ultra; on high only on the near trees (LOD0 + shadow-casting LOD1, the
-    // crowns where sky holes read as sparkles), handing over to the plain alpha test over the 8 m before shadowDist
-    // (the far-LOD1 fringe cost ~0.3 ms on the M1 for trees whose edges the impostor fringe takes over at 34+ m)
-    this.fringeFar = this.fringe && (q.key === 'ultra' || fr === 'full');
+    // 'near': the mesh-foliage fringe only on LOD0 + the shadow-casting LOD1, handing over to the plain alpha test over
+    // the 8 m before shadowDist (saves ~0.15 ms on the M1 but the 20-30 m crowns sparkle again; not used by a preset)
+    this.fringeFar = this.fringe && fr !== 'near';
     if (this.fringe && !this.fringeFar) FOLIAGE.fringeFade.value.set(this.shadowDist - 8, this.shadowDist);
     else FOLIAGE.fringeFade.value.set(1e9, 1e9 + 1);
     // coverage gains that make every LOD of a tree cover the same crown area (scratch/fix_dither/coverage.mjs, isolated
@@ -890,7 +909,7 @@ export class TreeField {
     // real Norway spruce at 30-50 m; the model's decimated LOD1 needs the larger gain)
     FOLIAGE.gain0.value.set(this.fringe ? 1.3 : 2.0, 2.0);
     FOLIAGE.gain1.value.set(this.fringe ? 1.7 : 3.0, 3.0);
-    FOLIAGE.impGain.value = this.impFringeOn ? 0.8 : 1.1;
+    FOLIAGE.impGain.value = this.impFringeOn ? 0.9 : 1.15;
     this.group = new THREE_.Group();
     this.group.name = 'trees';
     ctx.scene.add(this.group);
@@ -962,7 +981,7 @@ export class TreeField {
           const mat = isFol ? matFol[ml] : (key === 'bark_grey' ? matGrey[ml] : matBark[ml]);
           const im = new THREE.InstancedMesh(geo, mat, cap[lod]);
           im.name = `${names[vi]}_lod${lod}_${key}`;
-          // PERF (QA): every tree material discards (alpha test + dithered LOD crossfade), which defeats the M1's
+          // PERF (QA): every tree material discards (alpha test + LOD card thinning), which defeats the M1's
           // hidden-surface removal. Drawing the distance bands near -> far (LOD0, LOD1, LOD2, then impostors) lets
           // early-z reject hidden needle cards: -12 % GPU time in the escape drive, no visual change.
           im.renderOrder = 1 + lod;

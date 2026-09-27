@@ -366,6 +366,7 @@ attribute vec4 iS;     // scale, kind (0 rock chip, 1 mud, 2 wood splinter), see
 uniform float uTime;
 varying float vKind;
 varying float vShade;
+varying vec3 vChL;
 mat3 chipRot(vec3 ax, float a) {
   ax = normalize(ax); float s = sin(a), c = cos(a), oc = 1.0 - c;
   return mat3(oc * ax.x * ax.x + c, oc * ax.x * ax.y + ax.z * s, oc * ax.z * ax.x - ax.y * s,
@@ -393,7 +394,11 @@ vec3 chP = iP0 + iV * chTe + vec3(0.0, -4.905 * chTe * chTe, 0.0);
 if (chAge > chTl) { chP.xz += iV.xz * min(chAge - chTl, 0.2) * 0.25; chP.y = iT.z; }
 float chSc = iS.x * chAlive * (1.0 - smoothstep(0.8, 1.0, chAge / max(iT.y, 1e-3)));
 vec3 chShape = iS.y > 1.5 ? vec3(0.9, 0.22, 2.0) : vec3(1.0);   // wood: thin flat splinter
-vec3 transformed = chR * (position * chShape * chSc);
+// (QA) a flattened icosahedron is a pointed lens (read as seeds / petals in the chop shot); hatchet chips from spruce
+// are split slabs with blunt, torn ends: push the wood chip's vertices toward the box corners
+vec3 chPos = iS.y > 1.5 ? sign(position) * pow(abs(position), vec3(0.4)) : position;
+vChL = chPos * chShape;
+vec3 transformed = chR * (chPos * chShape * chSc);
 if (chSplat) { transformed.y *= 0.22; transformed.xz *= 1.7; transformed.y += chSc * 0.05; }
 transformed += chP;
 vKind = iS.y;
@@ -431,10 +436,13 @@ class ChipSystem {
         .replace('#include <beginnormal_vertex>', CHIP_NORMAL)
         .replace('#include <begin_vertex>', CHIP_VERT);
       sh.fragmentShader = sh.fragmentShader
-        .replace('#include <common>', '#include <common>\nvarying float vKind;\nvarying float vShade;')
+        .replace('#include <common>', '#include <common>\nvarying float vKind;\nvarying float vShade;\nvarying vec3 vChL;')
         .replace('#include <color_fragment>', `#include <color_fragment>
           // rock chip / wet mud / fresh spruce wood (pale sapwood, ~1 in 5 a dark bark flake)
           vec3 chWood = vShade > 1.18 ? vec3(0.075, 0.045, 0.03) : vec3(0.47, 0.335, 0.17) * (0.75 + 0.35 * vShade);
+          // growth rings / fibres run along the splinter (local z): fine lengthwise stripes, latewood darker
+          float chGr = fract(sin(floor(vChL.x * 3.5 + vChL.y * 2.0 + vShade * 17.0) * 43.7) * 7613.1);
+          chWood *= 0.8 + 0.2 * chGr - 0.1 * smoothstep(0.85, 1.0, abs(vChL.z) / 2.0);
           diffuseColor.rgb = vKind < 0.5 ? vec3(0.19, 0.18, 0.165) * vShade : (vKind < 1.5 ? vec3(0.06, 0.045, 0.032) * vShade : chWood);`)
         .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = vKind < 0.5 ? 0.72 : (vKind < 1.5 ? 0.22 : 0.6);');
     };
@@ -1128,7 +1136,12 @@ void main() {
     // defocus: the eye / lens is focused on the road, a 4 mm pupil blurs the glass (0.7 m) by ~3 px
     float blurR = 2.2 / max(mag * 0.5, 1.0);
     float edge = 1.0 - smoothstep(max(1.0 - blurR, 0.15), 1.0 + blurR * 0.3, r);
-    col = dcol; alpha = edge * smoothstep(0.0, 0.12, bage);
+    // (QA) a bead smaller than that ~5.5 mrad blur circle cannot show as a crisp dot: its light is spread over the
+    // blur disc at a fraction of the contrast. Drawn only over its own 1-2 px it was a full-contrast white pixel (the
+    // sky image in its lower half) -> hundreds of sparkles against the dark headwall. Fade sub-blur beads by
+    // diameter / blur (between peak-preserving and energy-conserving); beads larger than the blur are unchanged.
+    float sub = clamp(mag / max(0.0055 * uPxRad, 1.0), 0.2, 1.0);
+    col = dcol; alpha = edge * smoothstep(0.0, 0.12, bage) * sub;
   }
   // ---- rivulets: big drops run down (slow) or are blown up the glass (fast), leaving a wet trail ----------------
   {
