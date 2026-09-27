@@ -1,0 +1,7 @@
+node_modules
+dist
+scratch
+raw_assets
+.vercel
+.DS_Store
+tools/blender/__pycache__

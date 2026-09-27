@@ -1,0 +1,75 @@
+{
+ "version": 1,
+ "note": "Impostor atlas. uv origin bottom-left (three.js flipY). Frame (i=azimuth, j=elevation) of variant v covers u in [(x0 + i*frameW)/atlasW, (x0+(i+1)*frameW)/atlasW], v in [j*frameH/atlasH, (j+1)*frameH/atlasH]. Azimuth i*360/az deg is the direction from tree to camera in tree-local three.js coords, measured from +Z toward +X; elevation positive = camera above. Quad is view-aligned, centred on (0, pivotY, 0), size width x height. Albedo = sRGB albedo*AO, alpha coverage. Normal atlas (half res) = tree-local three.js normal*0.5+0.5.",
+ "albedo": "albedo.webp",
+ "normal": "normal.webp",
+ "atlasW": 5120,
+ "atlasH": 1536,
+ "normalScale": 0.5,
+ "frameW": 128,
+ "frameH": 384,
+ "azimuths": 8,
+ "elevations": [
+  -25.0,
+  0.0,
+  25.0,
+  50.0
+ ],
+ "variants": [
+  {
+   "name": "conifer_0",
+   "index": 0,
+   "x0": 0,
+   "width": 9.019057177414364,
+   "height": 27.05717153224309,
+   "pivotY": 12.0,
+   "treeHeight": 24.0,
+   "crownRadius": 3.1,
+   "kind": "spruce"
+  },
+  {
+   "name": "conifer_1",
+   "index": 1,
+   "x0": 1024,
+   "width": 8.75671365737915,
+   "height": 26.27014097213745,
+   "pivotY": 9.25,
+   "treeHeight": 18.5,
+   "crownRadius": 2.7,
+   "kind": "spruce"
+  },
+  {
+   "name": "conifer_2",
+   "index": 2,
+   "x0": 2048,
+   "width": 10.479812850952149,
+   "height": 31.439438552856444,
+   "pivotY": 14.0,
+   "treeHeight": 28.0,
+   "crownRadius": 3.3,
+   "kind": "spruce"
+  },
+  {
+   "name": "conifer_3",
+   "index": 3,
+   "x0": 3072,
+   "width": 9.861665668487548,
+   "height": 29.584997005462647,
+   "pivotY": 11.0,
+   "treeHeight": 22.0,
+   "crownRadius": 3.3,
+   "kind": "fir"
+  },
+  {
+   "name": "conifer_4",
+   "index": 4,
+   "x0": 4096,
+   "width": 5.252452164649965,
+   "height": 15.757356493949892,
+   "pivotY": 7.012500000000001,
+   "treeHeight": 16.5,
+   "crownRadius": 1.3,
+   "kind": "snag"
+  }
+ ]
+}
