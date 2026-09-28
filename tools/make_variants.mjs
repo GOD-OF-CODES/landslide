@@ -62,11 +62,15 @@ async function images(relList) {
   }
 }
 
+// Assets whose texture detail matters too much to shrink on low (the conifer needle atlas turns blotchy at 512)
+const KEEP_FULL = { lo: new Set(['models/trees.glb']), mid: new Set() };
+
 async function models(relList) {
   for (const rel of relList) {
     const src = path.join(PUB, rel);
     try { await fs.access(src); } catch { continue; }
     for (const [tier, size] of Object.entries(TIERS)) {
+      if (KEEP_FULL[tier]?.has(rel)) continue;
       const outRel = `q/${tier}/${rel}`;
       const out = path.join(PUB, outRel);
       await fs.mkdir(path.dirname(out), { recursive: true });

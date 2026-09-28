@@ -1,9 +1,8 @@
 import * as THREE from 'three';
-import { config, PARAMS, storedQuality } from './core/config.js';
+import { config } from './core/config.js';
 import { Events } from './core/events.js';
 import { Input } from './core/input.js';
 import { Assets, setVariantTier, BASE } from './core/assets.js';
-import { showQualityGate } from './ui/gate.js';
 import { RoadPath } from './core/road.js';
 import { Debug, flags } from './core/debug.js';
 import Physics from './physics/world.js';
@@ -52,15 +51,7 @@ function prefetch(assets) {
 async function boot() {
   const container = document.getElementById('app');
 
-  // 1) Quality first: it decides the renderer resolution and which asset variants get downloaded.
-  //    The pre-load screen is skipped for test/debug URLs and after a choice made earlier in this tab.
-  let gateDone = false;
-  try { gateDone = sessionStorage.getItem('landslide.gateDone') === '1'; } catch {}
-  if (!PARAMS.has('quality') && !flags.autostart && !flags.fixedCam && !gateDone) {
-    const key = await showQualityGate(storedQuality() ?? 'low');
-    config.setQuality(key);
-    try { sessionStorage.setItem('landslide.gateDone', '1'); } catch {}
-  }
+  // Quality was already chosen by src/boot.js (pre-load gate) before this module started.
   if (config.quality.assetTier) {
     try {
       const manifest = await fetch(BASE + 'assets/q/variants.json').then((r) => (r.ok ? r.json() : null));
@@ -239,8 +230,11 @@ function forceRenderable(scene) {
   return () => { for (let i = undo.length - 1; i >= 0; i--) undo[i](); };
 }
 
-boot().catch((e) => {
-  console.error('[boot] fatal', e);
-  document.body.insertAdjacentHTML('beforeend', `<pre style="position:fixed;inset:20px;color:#f88;background:#000c;padding:20px;z-index:99999;white-space:pre-wrap">Fatal error: ${e?.stack || e}</pre>`);
-  window.__READY = true;
-});
+/** Entry point, called by src/boot.js once the quality is chosen. */
+export function start() {
+  return boot().catch((e) => {
+    console.error('[boot] fatal', e);
+    document.body.insertAdjacentHTML('beforeend', `<pre style="position:fixed;inset:20px;color:#f88;background:#000c;padding:20px;z-index:99999;white-space:pre-wrap">Fatal error: ${e?.stack || e}</pre>`);
+    window.__READY = true;
+  });
+}

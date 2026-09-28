@@ -19,7 +19,7 @@ const ORDER = ['low', 'medium', 'high', 'ultra'];
  *  file counted once (QA: brown_mud_rocks_01 and car.glb are requested twice, the second time a 304 from the cache,
  *  which the earlier count included: High read 95). Code (JS, wasm, CSS) adds about 2.3 MB more on the wire.
  *  Shared with the loading screen, which counts the same bytes. config.js `download` is only a fallback. */
-export const DOWNLOAD_MB = { low: 24, medium: 37, high: 88, ultra: 88 };
+export const DOWNLOAD_MB = { low: 25, medium: 37, high: 88, ultra: 88 };
 export const QUALITY_INFO = INFO;
 const BACKDROP = `<div class="bd"><div class="bd-topo"></div>
   <div class="bd-ridge far"></div><div class="bd-fog f1"></div><div class="bd-ridge near"></div><div class="bd-fog f2"></div>
