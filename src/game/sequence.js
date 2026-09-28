@@ -305,10 +305,10 @@ export default class Sequence {
       hint: () => (onFootPlaying() ? 'Far too wide to drive across. It needs a bridge' : null),
       canUse: () => onFootPlaying() && inv.has('planks'),
       onHold: (p) => {
-        this._vm()?.place?.(p);
+        // planks stay in the inventory: no in-hand plank animation, the bridge simply appears on completion
         if (p > 0.82 && !this._plankSfx) { this._plankSfx = true; this._play('thud', { position: this.road.worldAt((this.markers.gap ?? 560) - 1.6, -1.5, new THREE.Vector3()) }); }
       },
-      onCancel: () => { this._vm()?.place?.(null); this._plankSfx = false; },
+      onCancel: () => { this._plankSfx = false; },
       use: () => self._placePlanks(),
     });
 
@@ -840,7 +840,9 @@ export default class Sequence {
     const ia = ctx.interact;
     const act = ia && ia.progress > 0 ? ia.current : null;
     let want = null, now = false;
-    if (act === 'place_planks' && inv.has('planks')) { want = 'planks'; now = true; }
+    // Planks are never shown in hand: they live in the inventory and are only used at the washout.
+    // While laying them the hands are lowered (nothing held); otherwise the hatchet is the default carry item.
+    if (act === 'place_planks' && inv.has('planks')) { want = null; now = true; }
     else if (act === 'refuel' && inv.has('jerrycan')) { want = 'jerrycan'; now = true; }
     else if ((act === 'chop' || this._chopping) && inv.has('hatchet')) { want = 'hatchet'; now = true; }
     else if (ctx.control === 'foot') {
@@ -850,9 +852,8 @@ export default class Sequence {
       if (this.car?.fuelCap?.getWorldPosition) cap = this.car.fuelCap.getWorldPosition(_v3);
       if (inv.has('hatchet') && treeUncut && near(ft.chopPoint, 12)) want = 'hatchet';
       else if (inv.has('jerrycan') && !this.flags.refueled && near(cap, 7)) want = 'jerrycan';
-      else if (inv.has('planks')) want = 'planks';
+      else if (inv.has('hatchet')) want = 'hatchet';
       else if (inv.has('jerrycan')) want = 'jerrycan';
-      else if (inv.has('hatchet') && treeUncut) want = 'hatchet';
     }
     if (want !== this._heldWant) { this._heldWant = want; this._heldT = 0; }
     else this._heldT = (this._heldT || 0) + dt;
