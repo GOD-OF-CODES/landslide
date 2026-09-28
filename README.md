@@ -143,6 +143,24 @@ node tools/sky.mjs                                          # sky-dome textures 
 - Each script has options (`--stage`, `--only`, `--fast`, …) documented at its top.
 - `public/assets/tex/` holds the engine's resized copies of the Poly Haven texture sets. `raw_assets/` (git-ignored) holds the full-size downloads that the Blender bakes and the sky tool read.
 
+## CrazyGames
+
+The game is ready to run inside the CrazyGames iframe (HTML5 SDK v3, loaded in `index.html`). All platform code is in
+`src/core/platform.js`:
+
+- **Standalone safe.** Every SDK call checks `SDK.environment`. It is `'disabled'` outside CrazyGames (e.g. on Vercel),
+  where the SDK would throw, so the game behaves exactly as before. `'local'` (localhost) shows demo ads.
+- **Loading / gameplay events.** `loadingStart` / `loadingStop` wrap the loading screen. `gameplayStart` / `gameplayStop`
+  follow active play: stop on the title menu, pause menu, death, win and during ads.
+- **Ads only at natural breaks.** A midgame ad is requested on *Retry* (after a death or from the pause menu) and on
+  *Quit to title*, never during play. While the break runs, the game is held: paused, input off, pointer released, faded
+  to black, menus ignored. Audio is suspended while the ad plays and the platform's `muteAudio` setting is respected.
+  Rewarded ads are not used: the run is short with generous checkpoints, so there is nothing to grant.
+- **`happytime`** fires when you escape into the tunnel.
+- **No host scrolling.** Space, arrows, Page Up/Down, Home/End and the wheel are prevented from scrolling the host page
+  (form controls and scrollable UI panels keep their normal behaviour).
+- Ads are skipped on automated-test URLs (`?autostart`, `?skip`, `?cam`); add `?adtest` to force them locally.
+
 ## Debug and testing
 
 URL flags (see `src/core/debug.js`):

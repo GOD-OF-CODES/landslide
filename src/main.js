@@ -7,6 +7,7 @@ import { RoadPath } from './core/road.js';
 import { Debug, flags } from './core/debug.js';
 import Physics from './physics/world.js';
 import { isStaleChunkError, recoverFromStaleBuild, showFatal } from './core/recover.js';
+import { platform } from './core/platform.js';
 
 // ---------------------------------------------------------------------------------------------
 // System registry. Each module default-exports a class: new X(ctx); optional async init();
@@ -52,6 +53,7 @@ function prefetch(assets) {
 
 async function boot() {
   const container = document.getElementById('app');
+  platform.loadingStart(); // CrazyGames: the loading screen starts here and ends at 'boot:done'
 
   // Quality was already chosen by src/boot.js (pre-load gate) before this module started.
   if (config.quality.assetTier) {
@@ -143,7 +145,9 @@ async function boot() {
   } catch (e) { console.warn('[boot] shader warm-up render', e); }
   unforce();
 
+  platform.attach(ctx);
   ctx.events.emit('boot:done', {});
+  platform.loadingStop();
   if (flags.autostart) ctx.events.emit('ui:start', { auto: true });
 
   const timer = new THREE.Timer();
@@ -210,6 +214,7 @@ async function boot() {
     if (ctx.post && !flags.nopost) call('post', 'render', rawDt);
     else renderer.render(scene, camera);
 
+    platform.update(ctx);
     ctx.debug.update(rawDt, renderer);
     if (readyFrames > 60) adaptResolution(rawDt);
     ctx.input.endFrame();
