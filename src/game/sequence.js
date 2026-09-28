@@ -246,7 +246,7 @@ export default class Sequence {
 
     // ---- chop the fallen tree (3 hold-E chops)
     ia.register({
-      id: 'chop', radius: 2.5, angle: 42, hold: this.tune.chopHold, repeat: true, priority: 0.2, focus: true,
+      id: 'chop', radius: 2.5, angle: 42, hold: this.tune.chopHold, repeat: true, priority: 0.2,
       position: () => {
         const ft = this.ctx.vegetation?.fallenTree;
         return ft && !ft.cut && ft.chopPoint ? ft.chopPoint : null;
@@ -261,17 +261,18 @@ export default class Sequence {
 
     // ---- refuel at the filler cap
     ia.register({
-      id: 'refuel', radius: 1.9, angle: 50, hold: this.tune.refuelHold, priority: 0.5, focus: true,
+      id: 'refuel', radius: 1.9, angle: 50, hold: this.tune.refuelHold, priority: 0.5,
       object: () => this.car?.fuelCap || null,
       requireVisible: false,
       prompt: 'Refuel',
       hint: () => (onFootPlaying() && !this.flags.refueled && !inv.has('jerrycan') ? 'Fuel filler. The tank is empty' : null),
       canUse: () => onFootPlaying() && inv.has('jerrycan'),
       onHold: (p) => {
-        // glug-glug: re-touching the pour voice keeps it looping
-        if (!this._pourT || this._rt - this._pourT > 0.45) { this._pourT = this._rt; this._pour = this._play('fuelPour', { position: this.car?.fuelCap }) || this._pour; }
+        this._vm()?.pour?.(p);
+        // glug-glug: re-touching the pour voice keeps it looping (it starts once the spout is over the filler)
+        if (p > 0.12 && (!this._pourT || this._rt - this._pourT > 0.45)) { this._pourT = this._rt; this._pour = this._play('fuelPour', { position: this.car?.fuelCap }) || this._pour; }
       },
-      onCancel: () => { try { this._pour?.stop?.(0.25); } catch {} this._pour = null; this._pourT = 0; },
+      onCancel: () => { this._vm()?.pour?.(null); try { this._pour?.stop?.(0.25); } catch {} this._pour = null; this._pourT = 0; },
       use: () => self._refuel(),
     });
 
@@ -293,7 +294,7 @@ export default class Sequence {
 
     // ---- lay the planks over the washout
     ia.register({
-      id: 'place_planks', radius: 2.9, angle: 55, hold: this.tune.planksHold, priority: 0.4, focus: true,
+      id: 'place_planks', radius: 2.9, angle: 55, hold: this.tune.planksHold, priority: 0.4,
       position: () => {
         if (!this.road || this.ctx.props?.bridge) return null;
         const p = this.road.worldAt((this.markers.gap ?? 560) - 1.9, -1.5, _v3);
@@ -303,8 +304,11 @@ export default class Sequence {
       prompt: 'Lay the planks across',
       hint: () => (onFootPlaying() ? 'Far too wide to drive across. It needs a bridge' : null),
       canUse: () => onFootPlaying() && inv.has('planks'),
-      onHold: (p) => { if (p > 0.05 && !this._plankSfx) { this._plankSfx = true; this._play('thud', { position: this.road.worldAt((this.markers.gap ?? 560) - 1.6, -1.5, new THREE.Vector3()) }); } },
-      onCancel: () => { this._plankSfx = false; },
+      onHold: (p) => {
+        this._vm()?.place?.(p);
+        if (p > 0.82 && !this._plankSfx) { this._plankSfx = true; this._play('thud', { position: this.road.worldAt((this.markers.gap ?? 560) - 1.6, -1.5, new THREE.Vector3()) }); }
+      },
+      onCancel: () => { this._vm()?.place?.(null); this._plankSfx = false; },
       use: () => self._placePlanks(),
     });
 
@@ -338,9 +342,21 @@ export default class Sequence {
   _carBeforeTree() { const pr = this.carProj(); return !pr || pr.s < (this.markers.fallenTree ?? 305) + 3; }
   _carBeforeGap() { const pr = this.carProj(); return !pr || pr.s < (this.markers.gap ?? 560); }
 
+  _vm() { return this.ctx.cameraRig?.viewmodel || null; }
+
   _pickup(id) {
     const { ctx } = this;
-    ctx.props?.hideItem?.(id);
+    // the free hand reaches out and takes it: the world copy disappears when the fingers close on it (the inventory
+    // changes at once, so the interaction and the objective update immediately)
+    const vm = this._vm();
+    const e = ctx.interact?.entries?.get?.('pickup_' + id);
+    const at = e && ctx.interact?.positionOf ? ctx.interact.positionOf(e, new THREE.Vector3()) : null;
+    if (vm?.ready && vm.reach && at && ctx.control === 'foot') {
+      // (guard: a checkpoint restore between the press and the hand closing puts the item back in the world)
+      const hide = () => { if (this.inventory.has(id)) ctx.props?.hideItem?.(id); };
+      vm.reach(at).then(hide, hide);
+      this._after(0.9, hide);
+    } else ctx.props?.hideItem?.(id);
     this.inventory.add(id);
     ctx.events?.emit?.('item:pickup', { id });
     ctx.interact?.lock?.(0.35);
@@ -797,10 +813,9 @@ export default class Sequence {
     if (this._pendingSkip) return;
     if (this.state === 'title') { this._updateTitle(); return; }
 
-    // hatchet in hand while it is useful; planks slow you down
+    // what the hands carry (viewmodel); planks slow you down
     const inv = this.inventory;
-    const ft = ctx.vegetation?.fallenTree;
-    ctx.cameraRig?.viewmodel?.setHeld?.(inv.has('hatchet') && ft && !ft.cut ? 'hatchet' : null);
+    this._updateHeld(rdt);
     if (this.player) this.player.speedScale = inv.has('planks') ? 0.84 : 1;
 
     switch (this.state) {
@@ -810,6 +825,38 @@ export default class Sequence {
       case 'driving': case 'escape': this._updateEscape(rdt); break;
       default: break;
     }
+  }
+
+  /** Which item the first-person hands show: the one in use (hold-E action) at once, otherwise the one that is useful
+   *  where the player stands (hatchet by the fallen tree, can by the car, planks near the washout), else the bulkiest
+   *  thing carried. A change must persist 0.3 s (no flicker at the boundaries). */
+  _updateHeld(dt) {
+    const vm = this._vm();
+    if (!vm?.setHeld) return;
+    const { ctx } = this;
+    const inv = this.inventory;
+    const ft = ctx.vegetation?.fallenTree;
+    const treeUncut = !!(ft && !ft.cut);
+    const ia = ctx.interact;
+    const act = ia && ia.progress > 0 ? ia.current : null;
+    let want = null, now = false;
+    if (act === 'place_planks' && inv.has('planks')) { want = 'planks'; now = true; }
+    else if (act === 'refuel' && inv.has('jerrycan')) { want = 'jerrycan'; now = true; }
+    else if ((act === 'chop' || this._chopping) && inv.has('hatchet')) { want = 'hatchet'; now = true; }
+    else if (ctx.control === 'foot') {
+      const eye = this.player?.eye;
+      const near = (p, r) => !!(eye && p && eye.distanceTo(p) < r);
+      let cap = null;
+      if (this.car?.fuelCap?.getWorldPosition) cap = this.car.fuelCap.getWorldPosition(_v3);
+      if (inv.has('hatchet') && treeUncut && near(ft.chopPoint, 12)) want = 'hatchet';
+      else if (inv.has('jerrycan') && !this.flags.refueled && near(cap, 7)) want = 'jerrycan';
+      else if (inv.has('planks')) want = 'planks';
+      else if (inv.has('jerrycan')) want = 'jerrycan';
+      else if (inv.has('hatchet') && treeUncut) want = 'hatchet';
+    }
+    if (want !== this._heldWant) { this._heldWant = want; this._heldT = 0; }
+    else this._heldT = (this._heldT || 0) + dt;
+    if (now || this._heldT > 0.3 || vm.held == null) vm.setHeld(want);
   }
 
   _updateIntro(dt) {
@@ -882,11 +929,13 @@ export default class Sequence {
       road.worldAt(scarS + 2, 2.5, back);
       back.y = road.pointAt(scarS, _v3).y + 3.5 - t * 1.5;
       target.copy(back);
-      // rack focus, as a camera operator would: from the car to the collapsing slope behind it (subtle: the out-of-
-      // focus plane only softens, it never smears)
-      const dCar = Math.max(2, pos.distanceTo(cp)), dSlope = pos.distanceTo(back);
-      const rack = smooth01(0.08, 0.5, t);
-      rig.focusOn?.(dCar + (dSlope - dCar) * rack, { range: 55, hold: 0.2, attack: 0.3, release: 0.8, force: true });
+      // focus: on the car (the subject in frame), the slope behind only softened as a large-format cinema prime wide
+      // open would at this wide angle (thin-lens CoC, cameraRig.lensRange); late in the shot the operator racks part of
+      // the way (in dioptres) toward the slide. The range is solved for both distances, so the car never goes soft.
+      const dCar = Math.max(2, pos.distanceTo(cp) - 0.6), dSlope = Math.max(dCar + 1, pos.distanceTo(back));
+      const rack = smooth01(0.55, 0.95, t) * 0.6;
+      const F = 1 / (1 / dCar + (1 / dSlope - 1 / dCar) * rack);
+      rig.focusOn?.(F, { ref: [dCar, dSlope], lens: 'cine', hold: 0.2, attack: 0.3, release: 0.8, force: true });
       return { fov: 58 };
     }, 3.4, { blend: 0.25 }).then(() => {
       if (!hadAuto && car.autopilot && this.state === 'intro') car.autopilot = prev || null;

@@ -41,6 +41,7 @@ function prefetch(assets) {
     assets.gltf('assets/world/terrain.glb'), assets.json('assets/world/scatter.json'),
     assets.gltf('assets/models/trees.glb'), assets.gltf('assets/models/props.glb'),
     assets.gltf('assets/models/rocks.glb'), assets.gltf('assets/models/car.glb'),
+    assets.gltf('assets/models/hands.glb'),
     assets.json('assets/sky/sky.json'), assets.hdr('assets/sky/env_2k.hdr'),
     ...['asphalt_02', 'concrete_wall_006', 'pine_bark', 'rough_wood', 'mud_forest', 'brown_mud_03',
       'brown_mud_rocks_01', 'brown_mud_02'].map((n) => assets.pbr(n)),

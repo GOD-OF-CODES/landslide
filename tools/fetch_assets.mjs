@@ -18,6 +18,10 @@ const TEXTURES = [
   // trees, rocks, props (Blender bakes) + a few engine materials
   ['pine_bark', '2k'], ['mossy_rock', '2k'], ['quarry_wall', '2k'], ['rock_01', '2k'], ['rough_wood', '1k'],
   ['ash_veneer', '1k'], ['hessian_230', '1k'], ['rust_coarse_01', '1k'],
+  ['brown_leather', '2k'],
+  ['stretch_poplin', '2k'],
+  ['knotted_pine_bark', '2k'],
+  ['mud_forest', '2k'],
 ];
 
 async function get(url, dest) {

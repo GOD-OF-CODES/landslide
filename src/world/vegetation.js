@@ -14,6 +14,8 @@
 //   vegetation.trees          TreeField (src/render/impostor.js)
 //   vegetation.grass          GrassField (src/render/grass.js)
 //   vegetation.removeTreesNear(pos: Vector3, radius)  // e.g. for trees swept away by the slide (extra)
+//   (ROUND 6) the fallen spruce also has two static nodes: fallen_debris (sprays, needles, torn-off branches, bark
+//   flakes, soil spilled from the root plate) and fallen_chips (hatchet chips, revealed blow by blow via uReveal).
 //   vegetation.ready          Promise resolved when everything is placed
 import * as THREE from 'three';
 import { TreeField, extractParts, createFoliageMaterial, createBarkMaterial, createTreeDepthMaterial, WIND, FOLIAGE } from '../render/impostor.js';
@@ -531,7 +533,8 @@ export default class Vegetation {
     // pick the smallest yaw for which the root plate (and the ground just behind it) is not inside the rock cut
     let yaw = 0.95, dirX = new THREE.Vector3();
     const groundAt = (p) => (ctx.terrain?.heightAt ? ctx.terrain.heightAt(p.x, p.z, roadY + 80) : null);
-    for (let a = 0.35; a <= 1.1; a += 0.05) {
+    // v2 model: the ground under the tree was surveyed at a fixed yaw (the crushed crown is draped over that ground)
+    for (let a = 0.35; a <= 1.1 && !info.yaw; a += 0.05) {
       dirX.copy(left).multiplyScalar(-Math.cos(a)).addScaledVector(tan, Math.sin(a)).normalize();
       const rp = _v.copy(P0).addScaledVector(dirX, rootX);
       const rp2 = _v2.copy(P0).addScaledVector(dirX, rootX - 1.0);
@@ -541,6 +544,7 @@ export default class Vegetation {
       const ok = (h, lim) => h === null || h === undefined || h < roadY + lim;
       if (ok(h1, 1.0) && ok(h2, 2.4)) break;
     }
+    if (info.yaw) yaw = info.yaw;
     this._fallenYaw = yaw;
     dirX.copy(left).multiplyScalar(-Math.cos(yaw)).addScaledVector(tan, Math.sin(yaw)).normalize();
     const rotY = Math.atan2(-dirX.z, dirX.x); // rotation about +Y that maps local +X to dirX
@@ -551,6 +555,10 @@ export default class Vegetation {
     this.group.add(root);
     root.updateMatrixWorld(true);
 
+    // (ROUND 6) the fallen spruce has its own materials: 'fallen' (unique baked atlas: stem bark, root plate, end
+    // grain, fresh wood; rain-soaked albedo, ARM roughness), and wind-patched foliage/bark (a lying crown does not sway
+    // like a standing tree: cards resting on the road are still, cards hanging in the air flutter a little).
+    const fmats = this._fallenMaterials(gltf);
     const makeObj = (name) => {
       const node = gltf.scene.getObjectByName(name);
       if (!node) return null;
@@ -558,23 +566,17 @@ export default class Vegetation {
       const g = new THREE.Group();
       g.name = name;
       for (const [key, geo] of Object.entries(parts)) {
-        const src = this._srcMat(gltf, key);
-        let mat;
-        if (key === 'foliage') mat = createFoliageMaterial({ map: src?.map, normalMap: src?.normalMap });
-        else if (key === 'bark' || key === 'bark_grey') mat = createBarkMaterial({ map: src?.map, normalMap: src?.normalMap, arm: src?.roughnessMap, moss: 0 });
-        else {
+        let mat = fmats[key];
+        if (!mat) {
+          const src = this._srcMat(gltf, key);
           mat = src ? src.clone() : new THREE.MeshStandardMaterial({ color: 0x6b5a45, roughness: 0.9 });
           mat.vertexColors = false; // COLOR_0 was renamed to aTree by extractParts
-          // rain-soaked root-plate earth: dark and slick (it read as pale sand next to the wet road)
-          // wet torn-out forest soil: linear albedo ~0.05-0.08 (the mud texture alone is ~0.2 and read as pale paper)
-          if (key === 'soil') { mat.color = new THREE.Color(0.34, 0.28, 0.22); mat.roughness = 0.6; mat.envMapIntensity = 0.6; }
-          if (key === 'wood_cut') { mat.color = new THREE.Color(0.9, 0.88, 0.85); mat.roughness = 0.8; }
         }
+        if (name === 'fallen_chips' && key === 'fallen') mat = fmats.chips;
         const mesh = new THREE.Mesh(geo, mat);
-        mesh.castShadow = true;
+        mesh.castShadow = name !== 'fallen_chips' && name !== 'fallen_debris';
         mesh.receiveShadow = key !== 'foliage';
-        if (key === 'foliage') mesh.customDepthMaterial = createTreeDepthMaterial(src?.map);
-        else if (key === 'bark') mesh.customDepthMaterial = createTreeDepthMaterial(null);
+        if (key === 'foliage') mesh.customDepthMaterial = fmats.foliageDepth;
         g.add(mesh);
       }
       return g;
@@ -584,7 +586,32 @@ export default class Vegetation {
     const halfA = makeObj('fallen_tree_a'), halfB = makeObj('fallen_tree_b');
     if (halfA) { halfA.visible = false; root.add(halfA); }
     if (halfB) { halfB.visible = false; root.add(halfB); }
+    // static road debris (broken sprays, needles, torn-off branch pieces, bark flakes) and the hatchet chips, which
+    // appear blow by blow (uReveal against the per-chip order in aTree.g)
+    const debris = makeObj('fallen_debris');
+    if (debris) root.add(debris);
+    const chips = makeObj('fallen_chips');
+    if (chips) root.add(chips);
 
+    // (ROUND 6) the crown of the v2 model droops over the drop-off: the crown boxes follow the stem axis, lifted so they
+    // never start inside the slope (a dynamic half that spawns interpenetrating gets launched at split). Probed once,
+    // before the tree's own fixed body exists.
+    if (info.v >= 2 && info.crown) {
+      const axisY = (x) => { const a = info.axis; for (let i = 0; i + 1 < a.length; i++) if (x <= a[i + 1][0]) { const f = (x - a[i][0]) / (a[i + 1][0] - a[i][0] || 1); return a[i][1] + (a[i + 1][1] - a[i][1]) * f; } return a[a.length - 1][1]; };
+      const c = info.crown, x0c = Math.max(c.x0, 4.2);
+      info._crownY = [];
+      for (let k = 0; k < 3; k++) {
+        const xm = x0c + (c.x1 - x0c) * (k + 0.5) / 3;
+        const hh = c.radius * (1 - 0.25 * k) * 0.3;
+        let y = axisY(xm);
+        for (const z of [-1, 0, 1]) {
+          const p = root.localToWorld(_v.set(xm, 0, z * c.radius * 0.5));
+          const gy = ctx.terrain?.heightAt ? ctx.terrain.heightAt(p.x, p.z, p.y + 30) : null;
+          if (gy !== null && gy !== undefined) y = Math.max(y, gy - root.position.y + hh + 0.08);
+        }
+        info._crownY.push(y);
+      }
+    }
     // ---- static colliders (compound capsules + root plate box) on a fixed body
     const phys = ctx.physics;
     let body = null;
@@ -616,17 +643,73 @@ export default class Vegetation {
         // 6 from game/sequence.js this was 20 per blow: confetti)
         try { ctx.particles?.debris?.(p.clone(), 5, { wood: true, speed: 3.2, up: 0.9 }); } catch {}
         this._hits++;
+        if (fmats.reveal) fmats.reveal.value = Math.min(1, this._hits / 3.4);
         try { self._chopScar(this, root, info); } catch (e) { console.warn('[vegetation] chop scar', e); }
       },
       split() {
         if (this.cut) return this._splitPromise || Promise.resolve();
         if (this._scar) this._scar.visible = false;
+        if (fmats.reveal) fmats.reveal.value = 1;
         this.cut = true;
         this._splitPromise = self._split(this);
         return this._splitPromise;
       },
     };
     this.fallenTree = ft;
+  }
+
+  /** Materials of the fallen spruce (see _buildFallenTree). Cached per gltf. */
+  _fallenMaterials(gltf) {
+    if (this._fmats) return this._fmats;
+    const src = (k) => this._srcMat(gltf, k);
+    // lying crown: no whole-tree sway (tr_h = 0), a small constant flutter radius instead of the distance from the
+    // trunk base, scaled per vertex by aTree.a (0 on cards resting on the road); normals lean up and away from the stem
+    const windPatch = (vs, weight) => vs
+      .replace('float tr_h = max(position.y, 0.0) * tr_s;', 'float tr_h = 0.0;')
+      .replace('float tr_r = length(position.xz) * tr_s;', 'float tr_r = 0.6;')
+      .replace('    transformed += tr_dw;', weight ? '    transformed += tr_dw * aTree.a;' : '')
+      .replace('vec3 sphN = normalize(vec3(position.x, 0.0, position.z) + vec3(0.0, 0.55 * length(position.xz) + 0.05, 0.0));',
+        'vec3 sphN = normalize(vec3(0.0, 0.75, 0.0) + vec3(0.0, 0.0, position.z) * 0.6);');
+    const patch = (m, key, weight) => {
+      const ob = m.onBeforeCompile;
+      m.onBeforeCompile = (sh, r) => { ob?.call(m, sh, r); sh.vertexShader = windPatch(sh.vertexShader, weight); };
+      m.customProgramCacheKey = () => key;
+      return m;
+    };
+    const fs = src('foliage');
+    // backFix: sprays pressed flat on the road are seen from either side; never flip their (up-bent) normal
+    const foliage = patch(createFoliageMaterial({ map: fs?.map, normalMap: fs?.normalMap, backFix: true }), 'fallen-foliage-v3', true);
+    const bs = src('bark'), gs = src('bark_grey');
+    const bark = patch(createBarkMaterial({ map: bs?.map, normalMap: bs?.normalMap, arm: bs?.roughnessMap, moss: 0 }), 'fallen-bark-v2', false);
+    const barkGrey = patch(createBarkMaterial({ map: gs?.map, normalMap: gs?.normalMap, arm: gs?.roughnessMap, moss: 0 }), 'fallen-barkg-v2', false);
+    const foliageDepth = patch(createTreeDepthMaterial(fs?.map), 'fallen-depth-f-v2', true);
+    // 'fallen': unique atlas. Albedo is baked in the rain-soaked state; roughness (G) and AO (R) from the ARM map;
+    // aTree.r carries baked contact occlusion (underside of the stem, inside the root plate, kerf bottom).
+    const fsrc = src('fallen');
+    const reveal = { value: 0 };
+    const mkFallen = (chips) => {
+      const m = new THREE.MeshStandardMaterial({
+        map: fsrc?.map || null, normalMap: fsrc?.normalMap || null,
+        roughnessMap: fsrc?.roughnessMap || null, aoMap: fsrc?.aoMap || null, aoMapIntensity: 1.0,
+        roughness: 1.0, metalness: 0.0, color: fsrc?.map ? 0xffffff : 0x4a3c30,
+      });
+      // bark relief: the baked tangent normals are from a 1.7 m scan filtered to ~2 mm/texel; x1.5 restores the depth
+      // of the scale edges that the filtering flattened
+      if (fsrc?.normalScale) m.normalScale.copy(fsrc.normalScale).multiplyScalar(1.5);
+      m.onBeforeCompile = (sh) => {
+        if (chips) sh.uniforms.uReveal = reveal;
+        sh.vertexShader = sh.vertexShader
+          .replace('#include <common>', '#include <common>\nattribute vec4 aTree;\nvarying vec2 vFAo;')
+          .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vFAo = aTree.rg;');
+        sh.fragmentShader = sh.fragmentShader
+          .replace('#include <common>', '#include <common>\nvarying vec2 vFAo;' + (chips ? '\nuniform float uReveal;' : ''))
+          .replace('#include <map_fragment>', (chips ? '  if (vFAo.y > uReveal) discard;\n' : '') + '#include <map_fragment>\n  diffuseColor.rgb *= vFAo.x;');
+      };
+      m.customProgramCacheKey = () => (chips ? 'fallen-chips-v1' : 'fallen-v2');
+      return m;
+    };
+    this._fmats = { foliage, bark, bark_grey: barkGrey, fallen: mkFallen(false), chips: mkFallen(true), foliageDepth, reveal };
+    return this._fmats;
   }
 
   /**
@@ -725,8 +808,10 @@ export default class Vegetation {
         const x0 = Math.max(c.x0, 4.2) + (c.x1 - Math.max(c.x0, 4.2)) * k / segs;
         const x1 = Math.max(c.x0, 4.2) + (c.x1 - Math.max(c.x0, 4.2)) * (k + 1) / segs;
         const rad = c.radius * (1 - 0.25 * k);
-        out.push({ desc: R.ColliderDesc.cuboid((x1 - x0) / 2, rad * 0.35, rad * 0.6)
-          .setTranslation((x0 + x1) / 2, 0.3 + rad * 0.25, 0).setFriction(0.8).setDensity(part ? 160 : 60) });
+        const cy = info._crownY ? info._crownY[k] : 0.3 + rad * 0.25;
+        const hy = info._crownY ? rad * 0.3 : rad * 0.35;
+        out.push({ desc: R.ColliderDesc.cuboid((x1 - x0) / 2, hy, rad * 0.6)
+          .setTranslation((x0 + x1) / 2, cy, 0).setFriction(0.8).setDensity(part ? 160 : 60) });
       }
       // a couple of stiff branch stubs under the road part (so the half does not roll like a perfect cylinder)
       for (const x of [1.4, 3.0]) {
