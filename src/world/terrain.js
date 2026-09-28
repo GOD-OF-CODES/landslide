@@ -709,7 +709,14 @@ export default class Terrain {
     // LOD radii (m): big boulders hi/lod1/lod2 22/50/130, mid boulders 15/32/60, stones 34.
     // (QA perf: was 28/60, 20/38, 40; the scar view at s=150 drew 410k rock triangles + 150k in the shadow pass.
     // A boulder keeps its silhouette and baked normal map through the LODs, so the earlier switch is not visible.)
-    const R_BIG = [22 * 22, 50 * 50, 130 * 130], R_MID = [15 * 15, 32 * 32, 60 * 60], STONE_R2 = 34 * 34;
+    const R_BIG = [22 * 22, 50 * 50, 130 * 130], R_MID = [15 * 15, 32 * 32, 60 * 60];
+    let STONE_R2 = 34 * 34;
+    // (LOWEND) Low: no LOD0 boulders (their 10 instanced draws + 10 shadow draws; LOD1 keeps the silhouette and baked
+    // normals at ~830x470), shorter LOD1/LOD2/stone radii. Medium: slightly shorter radii.
+    const qk = this.ctx.config?.quality?.key;
+    const lite = qk === 'low' || qk === 'medium';
+    if (qk === 'low') { R_BIG[0] = R_MID[0] = 0; R_BIG[1] = 32 * 32; R_BIG[2] = 95 * 95; R_MID[1] = 20 * 20; R_MID[2] = 45 * 45; STONE_R2 = 16 * 16; }
+    else if (qk === 'medium') { R_BIG[0] = 18 * 18; R_MID[0] = 12 * 12; R_BIG[2] = 115 * 115; R_MID[2] = 54 * 54; STONE_R2 = 30 * 30; }
     const B = this._rockBuckets;
     for (const b of this.rockBuckets) b.mesh.count = 0;
     for (const it of this.rockItems) {
@@ -719,7 +726,7 @@ export default class Terrain {
       if (it.hi >= 0) {
         const R = it.big ? R_BIG : R_MID;
         if (d2 < R[0]) k = it.hi; else if (d2 < R[1]) k = it.hi + 10; else if (d2 < R[2]) k = it.hi + 20;
-      } else if (d2 < (it.r2 || STONE_R2)) k = it.stone;
+      } else if (d2 < Math.min(it.r2 || STONE_R2, qk === 'low' ? STONE_R2 : 1e12)) k = it.stone;
       if (k < 0 || !B[k]?.mesh) continue;
       const m = B[k].mesh;
       m.setColorAt(m.count, it.col);
@@ -728,6 +735,8 @@ export default class Terrain {
     for (const b of this.rockBuckets) {
       b.mesh.instanceMatrix.needsUpdate = true;
       if (b.mesh.instanceColor) b.mesh.instanceColor.needsUpdate = true;
+      // (LOWEND) an empty bucket still costs a program switch + uniform upload per pass: skip it entirely
+      if (lite) b.mesh.visible = b.mesh.count > 0;
     }
   }
 

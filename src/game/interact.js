@@ -15,6 +15,7 @@
 //     onHold(progress, dt),        // optional: called every frame while holding (e.g. glug audio, hatchet wind-up)
 //     onCancel(),                  // optional: hold released before completing
 //     repeat = false,              // hold again without releasing E (chopping rhythm)
+//     focus = false,               // inspection: while targeted on foot, the camera racks focus onto it (cameraRig.focusOn)
 //   })
 //   interact.unregister(id)
 //   interact.current            // id of the targeted entry or null
@@ -39,6 +40,7 @@ export default class Interact {
     this._lastPrompt = undefined;
     this._lastProg = null;
     this._holding = null;
+    this._dwell = 0; this._dwellId = null;
   }
 
   register(e) {
@@ -105,7 +107,7 @@ export default class Interact {
     const eye = pl.eye;
     const look = pl.lookDir ? pl.lookDir(_dir) : _dir.set(0, 0, -1);
     const feet = pl.feet || pl.position || eye;
-    let best = null, bestScore = -Infinity, bestUsable = false;
+    let best = null, bestScore = -Infinity, bestUsable = false, bestDist = 0;
     for (const e of this.entries.values()) {
       if (e.mode !== 'foot') continue;
       const p = this.positionOf(e);
@@ -123,9 +125,9 @@ export default class Interact {
       const usable = this._usable(e);
       if (!usable && !this._hintText(e)) continue;
       const score = cos * 1.2 - dist / e.radius * 0.5 + e.priority + (usable ? 0.3 : 0);
-      if (score > bestScore) { bestScore = score; best = e; bestUsable = usable; }
+      if (score > bestScore) { bestScore = score; best = e; bestUsable = usable; bestDist = dEye; }
     }
-    return best ? { e: best, usable: bestUsable } : null;
+    return best ? { e: best, usable: bestUsable, dist: bestDist } : null;
   }
 
   update(dt) {
@@ -149,6 +151,18 @@ export default class Interact {
     if (!e || (this._holding && this._holding !== e)) this._cancelHold();
     this.current = e ? e.id : null;
     if (!e) { this._setPrompt(null, null); return; }
+    // inspecting something up close: the lens racks focus onto it (subtle background blur; post DOF, Ultra/High only).
+    // Brief by design: from 0.3 s to ~2 s after the player stops to look at it, and while a hold-to-use action runs on
+    // it; the rig then eases the blur out and switches the DOF pass off again.
+    if (e.focus && pick.dist > 0) {
+      this._dwell = this._dwellId === e.id ? this._dwell + dt : 0;
+      this._dwellId = e.id;
+      const v = ctx.player?.velocity;
+      const still = !v || Math.hypot(v.x, v.z) < 1.6;
+      if ((still && this._dwell > 0.3 && this._dwell < 2.2) || (this._holding === e && this.progress > 0)) {
+        try { ctx.cameraRig?.focusOn?.(pick.dist, { hold: 0.2 }); } catch {}
+      }
+    } else this._dwellId = null;
 
     if (!pick.usable) {
       this._setPrompt(this._hintText(e), null);

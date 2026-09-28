@@ -15,10 +15,12 @@
 //   clear()                remove all rocks/debris and the front (checkpoint restart)
 //   Extra for particles/audio: front {active, s, speed, height, visS}, frontPoint(d, out) (snout world point),
 //   rockCount, surfaceY(s, d) (top of the debris mass or null)
-// Events: 'impact' {position: Vector3, energy (≈KE/1e5), radius, source:'rock'|'front'},
+// Events: 'impact' {position: Vector3, energy (≈KE/1e5), radius, source:'rock'|'front', hits, surface:'mud'|'asphalt'|
+//         'gravel'|'rock' (what the rock hit: particles throw mud from soil, chips + water spray from asphalt), ground (y)},
 //         'hazard:hit' {target:'player'|'car', cause:'boulder'|'front', energy}
 import * as THREE from 'three';
 import { G, groups } from '../physics/world.js';
+import { PAL, palMix } from './particles.js';
 
 const clamp = THREE.MathUtils.clamp;
 const lerp = THREE.MathUtils.lerp;
@@ -384,6 +386,8 @@ export default class Landslide {
     this._burst = 0;
     this._frontImpactT = 0;
     this.maxRocks = ctx.config?.quality?.maxRocks ?? 60;
+    // set-piece dust through the particle pools: Ultra/High keep every puff, Medium/Low thin them out
+    this.fxQ = { ultra: 1, high: 1, medium: 0.5, low: 0.3 }[ctx.config?.quality?.key] ?? 1;
     this._groundRows = new Map();
     this._frontDirty = true;
     this._visS = 0;
@@ -750,9 +754,10 @@ export default class Landslide {
       p.y = gy + 1.5 + rnd() * 3;
       const l = ctx.road.leftAt(s, _l);
       _v.set(-l.x * (1 + rnd() * 3), 0.8 + rnd() * 1.6, -l.z * (1 + rnd() * 3));
-      const t = rnd();
-      _col.setRGB(0.3 + t * 0.05, 0.275 + t * 0.04, 0.245 + t * 0.03);
-      if (!this._puff(p, _v, 8 + rnd() * 5, 4 + rnd() * 3, 13 + rnd() * 9, 0.24 + rnd() * 0.16, _col, gy, 0.2, 0.6, 1.2)) ctx.particles?.dust?.(p, 8, 3);
+      // brownish grey, lighter where it billows higher over the scar (sky-lit), darker in the churn low down
+      const hf = clamp((p.y - gy - 1.5) / 3, 0, 1);
+      palMix(_col, PAL.slideBase, PAL.slideTop, 0.45 + hf * 0.4 + rnd() * 0.15, 0.07);
+      if (!this._puff(p, _v, 8 + rnd() * 5, 4 + rnd() * 3, 13 + rnd() * 9, 0.28 + rnd() * 0.18, _col, gy, 0.2, 0.6, 1.2, 0.1 + (1 - hf) * 0.25)) ctx.particles?.dust?.(p, 8, 3);
     });
     // ground surge as the mud tongue crosses the road
     for (let k = 0; k < 7; k++) this._at(1.3 + k * 0.3, () => {
@@ -762,9 +767,9 @@ export default class Landslide {
       const l = ctx.road.leftAt(s, _l), tg = ctx.road.tangentAt(s, _u);
       const side = (rnd() - 0.5) * 4;
       _v.set(-l.x * (2 + rnd() * 3) + tg.x * side, 0.4 + rnd() * 0.6, -l.z * (2 + rnd() * 3) + tg.z * side);
-      const t = rnd();
-      _col.setRGB(0.31 + t * 0.04, 0.27 + t * 0.03, 0.22 + t * 0.03);
-      this._puff(p, _v, 8 + rnd() * 5, 3 + rnd() * 2, 11 + rnd() * 7, 0.32 + rnd() * 0.15, _col, gy, 0.08, 1.2, 1.4);
+      // the mud tongue's surge: mud spray + water, dense and dark at the base of the cloud
+      palMix(_col, PAL.slideBase, PAL.slideTop, rnd() * 0.25, 0.07);
+      this._puff(p, _v, 7 + rnd() * 4, 3 + rnd() * 2, 11 + rnd() * 7, 0.34 + rnd() * 0.15, _col, gy, 0.03, 1.2, 1.5, 0.6);
     });
   }
 
@@ -1559,9 +1564,8 @@ export default class Landslide {
       const f = this.spawnBoulder(q, new THREE.Vector3((this.rng() - 0.5) * 2, 1 + this.rng(), (this.rng() - 0.5) * 2), clamp(rr * (0.28 + this.rng() * 0.12), 0.12, 0.4), { mud: 0.5 });
       if (f) { f.lethal = false; f.nudges = 9; }
     }
-    ctx.particles?.dust?.(at.clone(), 1.5 + rr * 2, 0.8);
-    ctx.particles?.debris?.(at.clone(), 10);
-    ctx.events?.emit('impact', { position: at, energy: 0.6 * rr, radius: rr, source: 'rock' });
+    ctx.particles?.dust?.(at.clone(), 1.2 + rr * 1.5, 0.5);
+    ctx.events?.emit('impact', { position: at, energy: 0.6 * rr, radius: rr, source: 'rock', surface: 'rock' });
     return true;
   }
 
@@ -1571,26 +1575,42 @@ export default class Landslide {
    * a gouge / mud splat on the ground, a billowing cloud of crushed rock + soil for big blocks, a spray of mud, and
    * the first hard hit of a big block breaks pieces off it (fresh rockfall blocks fracture on the first impact).
    */
-  _onRockImpact(R, pos, e, dv, nx, ny, nz) {
+  _onRockImpact(R, pos, e, dv, hit, surface) {
     const { ctx } = this;
     const cam = ctx.camera.position;
     const d2 = R.pos.distanceToSquared(cam);
     if (d2 > 260 * 260) return;
-    const phys = ctx.physics;
-    // ground impact? (the push points out of the surface: look back along it)
-    let hit = null;
-    if (ny > 0.35 && phys?.raycast) hit = phys.raycast(R.pos, _u.set(-nx, -ny, -nz), R.r * 1.8 + 0.3, { groups: groups(G.ALL, G.STATIC), excludeCollider: this.wallCollider });
     if (hit && this.decals && d2 < 160 * 160 && R.r >= 0.15 && e > 0.02) {
       const v = R.prevV, vh = Math.hypot(v.x, v.z);
       const w = R.r * (1.3 + Math.min(e, 4) * 0.12);
       const len = w * (1 + Math.min(vh * 0.1, 1.6));
       this.decals.add(hit.point, hit.normal, vh > 0.5 ? _w.set(v.x, 0, v.z) : null, len, w, R.hits <= 2 ? 0 : 2, clamp(0.55 + e * 0.2, 0.55, 1));
     }
-    // big blocks: a rolling cloud of pulverised rock and soil (wet slope: brown-grey, settles within ~10 s)
-    if (R.r >= 0.42 && R.hits <= 2 && e > 0.35) this._impactCloud(pos, R.r, e, hit ? hit.point.y : pos.y - R.r);
-    if (R.r >= 0.3 && R.hits <= 3 && d2 < 140 * 140 && d2 > 36) ctx.particles?.debris?.(pos, Math.round(clamp(3 + R.r * 7, 3, 12)), { speed: 2 + Math.sqrt(e) * 2.2, mud: 0.85, up: 0.9 });
+    // big blocks: a rolling cloud of pulverised rock and soil (wet slope: brown-grey, settles within ~10 s). The
+    // spray, clots / chips and the low mist of every hit come from particles.impact() via the 'impact' event.
+    if (R.r >= 0.42 && R.hits <= 2 && e > 0.35) this._impactCloud(pos, R.r, e, hit ? hit.point.y : pos.y - R.r, surface);
     if (R.hits === 1 && R.r >= 0.5 && dv > 4.5 && !R.frag) return this._fragment(R, pos, e);
     return false;
+  }
+
+  /** Ground contact of a rock impact (the push points out of the surface: look back along it) and its surface class
+   *  for the particles: 'mud' (the debris mass, the scar, soil), 'asphalt', 'gravel' or 'rock' (rock-on-rock). */
+  _impactGround(R, pos, nx, ny, nz) {
+    const { ctx } = this;
+    const phys = ctx.physics;
+    let hit = null;
+    if (ny > 0.35 && phys?.raycast) hit = phys.raycast(R.pos, _u.set(-nx, -ny, -nz), R.r * 1.8 + 0.3, { groups: groups(G.ALL, G.STATIC), excludeCollider: this.wallCollider });
+    // landed on the debris mass itself
+    if (this.frontS > 0 && ctx.road) {
+      const pr = ctx.road.project(pos, this._prImp || (this._prImp = {}));
+      if (pr.s < this._visS + FRONT_SNOUT && pr.d > FRONT_D0 && pr.d < FRONT_D1) {
+        const y = this.surfaceY(pr.s, pr.d);
+        if (y != null && pos.y < y + R.r + 0.6) return { hit, surface: 'mud' };
+      }
+    }
+    if (!hit) return { hit, surface: 'rock' };
+    const t = ctx.terrain?.surfaceAt?.(hit.point);
+    return { hit, surface: t === 'asphalt' || t === 'gravel' || t === 'rock' ? t : 'mud' };
   }
 
   /** Break a block on its first hard impact. Timed (aimed) rocks keep their size and path: they only shed pieces. */
@@ -1645,14 +1665,21 @@ export default class Landslide {
   }
 
   /** One lit soft puff through the particle system's dust pool (bypasses its budget for set pieces). */
-  _puff(p, vel, life, s0, s1, op, col, ground, buoy = 0.15, drag = 1.2, aspect = 1) {
+  _puff(p, vel, life, s0, s1, op, col, ground, buoy = 0.15, drag = 1.2, aspect = 1, soft = 0) {
     const D = this.ctx.particles?.dustSys;
-    if (D && typeof D.emit === 'function') { D.emit(p, vel, life, s0, s1, op, col, ground, buoy, 1, aspect, drag); return true; }
+    if (D && typeof D.emit === 'function') {
+      // Medium / Low: fewer puffs (Math.random, not this.rng: the seeded stream drives the rocks and must not differ by preset)
+      if (this.fxQ < 1 && Math.random() > this.fxQ) return true;
+      D.emit(p, vel, life, s0, s1, op, col, ground, buoy, 1, aspect, drag, soft);
+      return true;
+    }
     return false;
   }
 
-  /** Crushed-rock + soil cloud of a big impact: a ground surge that rolls out first, then a slowly rising billow. */
-  _impactCloud(pos, r, e, groundY) {
+  /** Crushed-rock + soil cloud of a big impact: a dark ground surge (mud + water) that rolls out first, then a thinner,
+   *  lighter brownish-grey billow rising above it (lit from above). A block landing on asphalt or bare rock throws far
+   *  less of it than one gouging into the soil. */
+  _impactCloud(pos, r, e, groundY, surface = 'mud') {
     const { ctx } = this;
     const cam = ctx.camera.position;
     const dist = pos.distanceTo(cam);
@@ -1664,18 +1691,20 @@ export default class Landslide {
     for (const c of this._clouds) if (c.p.distanceToSquared(pos) < 9) return;
     if ((this._cloudBudget ?? 20) < 2) return;
     this._clouds.push({ p: pos.clone(), t: now });
+    const hard = surface === 'asphalt' || surface === 'rock';
     const k = clamp(Math.sqrt(e), 0.6, 3.5);
-    const n = Math.min(Math.floor(this._cloudBudget ?? 20), Math.round(clamp(1.5 + r * 2 + k * 0.7, 2, 6) * (dist < 12 ? 0.5 : 1)));
+    const n = Math.min(Math.floor(this._cloudBudget ?? 20), Math.round(clamp(1.5 + r * 2 + k * 0.7, 2, 6) * (dist < 12 ? 0.5 : 1) * (hard ? 0.6 : 1)));
     this._cloudBudget = (this._cloudBudget ?? 20) - n;
     for (let i = 0; i < n; i++) {
       const a = rnd() * Math.PI * 2, sp = (1.5 + k * 1.6) * (0.5 + rnd() * 0.8);
-      const surge = i < n * 0.5;
-      _v.set(Math.cos(a) * sp, surge ? 0.3 + rnd() * 0.5 : 1.2 + rnd() * 1.8, Math.sin(a) * sp);
-      _w.set(pos.x + Math.cos(a) * r * 0.6, Math.max(pos.y, groundY + r * 0.6) + rnd() * r, pos.z + Math.sin(a) * r * 0.6);
-      const t = rnd();
-      _col.setRGB(0.28 + t * 0.05, 0.255 + t * 0.04, 0.225 + t * 0.03);
+      const surge = i < Math.max(1, n * 0.55);
+      _v.set(Math.cos(a) * sp, surge ? 0.2 + rnd() * 0.4 : 1.0 + rnd() * 1.6, Math.sin(a) * sp);
+      _w.set(pos.x + Math.cos(a) * r * 0.6, Math.max(pos.y, groundY + r * 0.6) + rnd() * r * (surge ? 0.4 : 1.2), pos.z + Math.sin(a) * r * 0.6);
+      if (hard) palMix(_col, PAL.rockMist, PAL.slideTop, surge ? 0.1 : 0.5, 0.06);
+      else palMix(_col, PAL.slideBase, PAL.slideTop, surge ? rnd() * 0.2 : 0.55 + rnd() * 0.45, 0.07);
       const s0 = r * (1.0 + rnd() * 0.8), s1 = (surge ? 3 : 4) + r * (1.5 + rnd() * 1.5) + k * 0.9;
-      if (!this._puff(_w, _v, 5 + rnd() * 5, s0, s1, 0.15 + rnd() * 0.12, _col, groundY, surge ? 0.04 : 0.2, surge ? 1.4 : 0.8, surge ? 1.4 : 1)) {
+      const op = surge ? 0.22 + rnd() * 0.12 : 0.12 + rnd() * 0.1;
+      if (!this._puff(_w, _v, (surge ? 4 : 5) + rnd() * 4, s0, s1, op, _col, groundY, surge ? 0.02 : 0.18, surge ? 1.5 : 0.8, surge ? 1.5 : 1, surge ? 0.6 : 0.3)) {
         ctx.particles?.dust?.(pos, clamp(r * 3 + k, 1, 9), e);
         return;
       }
@@ -1703,14 +1732,17 @@ export default class Landslide {
       ctx.road.worldAt(sb, d, _w);
       const sy = this.surfaceY(sb, d) ?? _w.y + F.height;
       const gy = sy - 0.5;
-      _w.y = sy + F.height * (0.35 + rnd() * 0.6);
+      // height in the plume: the base (mud + water spray churned off the flow) is dark, dense and hugs the surface;
+      // the fines that make it higher are lighter brownish grey and thinner, lit from above
+      const hf = rnd();
+      _w.y = sy + F.height * (0.2 + hf * 0.75);
       const near = dist < 22;
-      const t = rnd();
-      _col.setRGB(0.3 + t * 0.05, 0.27 + t * 0.04, 0.235 + t * 0.03);
+      palMix(_col, PAL.frontBase, PAL.slideTop, 0.15 + hf * 0.8, 0.07);
       const tg = ctx.road.tangentAt(this._visS, _u);
-      _v.set(0, 1.0 + rnd() * 1.6, 0).addScaledVector(tg, fs * (0.6 + rnd() * 0.4));
+      _v.set(0, 0.6 + hf * 0.8 + rnd() * 1.2, 0).addScaledVector(tg, fs * (0.6 + rnd() * 0.4));
       const s1 = (near ? 5 : 7) + rnd() * (near ? 3 : 6) + Math.min(fs, 12) * 0.3;
-      this._puff(_w, _v, 5 + rnd() * 3.5, 2 + rnd() * 2, s1, (near ? 0.12 : 0.2) + rnd() * 0.12, _col, gy, 0.3 + rnd() * 0.25, 0.7);
+      const op = lerp(near ? 0.2 : 0.3, near ? 0.09 : 0.14, hf) + rnd() * 0.08;
+      this._puff(_w, _v, 5 + rnd() * 3.5, 2 + rnd() * 2, s1, op, _col, gy, 0.12 + hf * 0.35 + rnd() * 0.1, 0.7, 1 + (1 - hf) * 0.5, lerp(0.55, 0.25, hf));
     }
   }
 
@@ -1747,9 +1779,13 @@ export default class Landslide {
         R.cool = 0.12; R.hits++; impacts++; R.hitT = R.age;
         const e = 0.5 * R.mass * dv * dv / 1e5;
         const pos = new THREE.Vector3(t.x - dvx / dv * R.r * 0.8, t.y - dvy / dv * R.r * 0.8, t.z - dvz / dv * R.r * 0.8);
-        ctx.events?.emit('impact', { position: pos, energy: e, radius: R.r, source: 'rock', hits: R.hits });
+        // what did it hit? (ground contact + surface type: particles throw mud from soil, chips + water from asphalt)
+        let hit = null, surface = 'rock';
+        // (only within effect range: particles ignore hits > 450 m away, _onRockImpact > 260 m)
+        if (pos.distanceToSquared(ctx.camera.position) < 450 * 450) { try { ({ hit, surface } = this._impactGround(R, pos, dvx / dv, dvy / dv, dvz / dv)); } catch { /* fx only */ } }
+        ctx.events?.emit('impact', { position: pos, energy: e, radius: R.r, source: 'rock', hits: R.hits, surface, ground: hit ? hit.point.y : undefined });
         let gone = false;
-        try { gone = this._onRockImpact(R, pos, e, dv, dvx / dv, dvy / dv, dvz / dv) === true; } catch (err) { if (!this._impErr) { this._impErr = true; console.warn('[landslide] impact fx', err); } }
+        try { gone = this._onRockImpact(R, pos, e, dv, hit, surface) === true; } catch (err) { if (!this._impErr) { this._impErr = true; console.warn('[landslide] impact fx', err); } }
         if (gone || !R.body) continue;
       }
       R.prevV.set(v.x, v.y, v.z);
@@ -1850,8 +1886,8 @@ export default class Landslide {
     const chips = P?.chips, drops = P?.drops, dust = P?.dustSys;
     if (!chips && !drops) return;
     const cam = this.ctx.camera;
-    this._chipB = Math.min((this._chipB ?? 0) + dt * 70, 14);
-    this._dropB = Math.min((this._dropB ?? 0) + dt * 90, 18);
+    this._chipB = Math.min((this._chipB ?? 0) + dt * 70 * this.fxQ, 14);
+    this._dropB = Math.min((this._dropB ?? 0) + dt * 90 * this.fxQ, 18);
     this._wispB = Math.min((this._wispB ?? 0) + dt * 36, 4);
     if (!this.rocks.length) return;
     const fr = this._frustum || (this._frustum = new THREE.Frustum());
@@ -1916,9 +1952,8 @@ export default class Landslide {
         _p.copy(R.pos).addScaledVector(_u, R.r * 0.6).addScaledVector(v, -0.03 - rnd() * 0.03);
         _w.set(v.x, v.y, v.z).multiplyScalar(0.25 + rnd() * 0.15);
         _w.addScaledVector(_u, 0.8);
-        const t = rnd();
-        _col.setRGB(0.1 + t * 0.03, 0.085 + t * 0.025, 0.07 + t * 0.02);
-        dust.emit(_p, _w, 0.6 + rnd() * 0.5, R.r * 0.3, R.r * (0.9 + rnd() * 0.4), 0.16 + rnd() * 0.1, _col, gy, 0.03, 1, 1, 2.6);
+        palMix(_col, PAL.frontBase, PAL.soilMist, rnd() * 0.6, 0.08);
+        dust.emit(_p, _w, 0.6 + rnd() * 0.5, R.r * 0.3, R.r * (0.9 + rnd() * 0.4), 0.16 + rnd() * 0.1, _col, gy, 0.03, 1, 1, 2.6, 0.5);
       }
       if (R._wkAcc > 3) R._wkAcc = 3;
     }
@@ -2341,19 +2376,20 @@ class SlideDecals {
         .replace('#include <map_fragment>', `#include <map_fragment>
           {
             vec4 spl = texture2D( dcSplat, vDcUv * 0.5 + vec2( mod( vDec.x, 2.0 ), floor( vDec.x * 0.5 ) ) * 0.5 );
-            // smeared mud on dark wet asphalt reads warm and lighter (silt + clay, linear ~0.12-0.17); the gouge core is
-            // darker churned soil mixed with pale pulverised rock
+            // smeared mud on dark wet asphalt reads warm and a little lighter (saturated silt + clay, linear ~0.09-0.13,
+            // the rain keeps it wet and glossy); the gouge core is darker churned soil mixed with pulverised rock, which
+            // the rain wets down to a mid grey (dry scuffs would be near white)
             float ml = dot( diffuseColor.rgb, vec3( 0.3, 0.59, 0.11 ) );
-            vec3 dMud = vec3( 0.14, 0.092, 0.052 ) * clamp( 0.45 + ml * 24.0, 0.4, 1.4 );
-            vec3 dCrush = mix( dMud * 0.5, vec3( 0.19, 0.18, 0.17 ), 0.55 + 0.45 * spl.b );
+            vec3 dMud = vec3( 0.12, 0.078, 0.045 ) * clamp( 0.45 + ml * 20.0, 0.4, 1.15 );
+            vec3 dCrush = mix( dMud * 0.5, vec3( 0.15, 0.143, 0.133 ), 0.55 + 0.45 * spl.b );
             diffuseColor.rgb = mix( dMud, dCrush, spl.g );
             diffuseColor.a *= clamp( spl.r * vDec.y, 0.0, 1.0 );
             if ( diffuseColor.a < 0.02 ) discard;
             dcGloss = spl.b;
           }`)
-        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix( 0.74, 0.48, dcGloss );');
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix( 0.6, 0.36, dcGloss );');
     };
-    mat.customProgramCacheKey = () => 'slidedecal1';
+    mat.customProgramCacheKey = () => 'slidedecal2';
     this.mesh = new THREE.InstancedMesh(g, mat, cap);
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.mesh.count = 0;

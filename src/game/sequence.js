@@ -233,7 +233,7 @@ export default class Sequence {
 
     // ---- pick-ups at the roadworks
     const pickup = (id, prompt, radius) => ia.register({
-      id: 'pickup_' + id, radius, angle: 34,
+      id: 'pickup_' + id, radius, angle: 34, focus: true,
       object: () => this.ctx.props?.items?.[id] || null,
       offset: ITEM_OFFSETS[id],
       prompt,
@@ -246,7 +246,7 @@ export default class Sequence {
 
     // ---- chop the fallen tree (3 hold-E chops)
     ia.register({
-      id: 'chop', radius: 2.5, angle: 42, hold: this.tune.chopHold, repeat: true, priority: 0.2,
+      id: 'chop', radius: 2.5, angle: 42, hold: this.tune.chopHold, repeat: true, priority: 0.2, focus: true,
       position: () => {
         const ft = this.ctx.vegetation?.fallenTree;
         return ft && !ft.cut && ft.chopPoint ? ft.chopPoint : null;
@@ -261,7 +261,7 @@ export default class Sequence {
 
     // ---- refuel at the filler cap
     ia.register({
-      id: 'refuel', radius: 1.9, angle: 50, hold: this.tune.refuelHold, priority: 0.5,
+      id: 'refuel', radius: 1.9, angle: 50, hold: this.tune.refuelHold, priority: 0.5, focus: true,
       object: () => this.car?.fuelCap || null,
       requireVisible: false,
       prompt: 'Refuel',
@@ -293,7 +293,7 @@ export default class Sequence {
 
     // ---- lay the planks over the washout
     ia.register({
-      id: 'place_planks', radius: 2.9, angle: 55, hold: this.tune.planksHold, priority: 0.4,
+      id: 'place_planks', radius: 2.9, angle: 55, hold: this.tune.planksHold, priority: 0.4, focus: true,
       position: () => {
         if (!this.road || this.ctx.props?.bridge) return null;
         const p = this.road.worldAt((this.markers.gap ?? 560) - 1.9, -1.5, _v3);
@@ -509,12 +509,30 @@ export default class Sequence {
     const rig = this.ctx.cameraRig, road = this.road;
     if (!rig?.cinematic || !road) return;
     this.ctx.control = 'none';
-    rig.cinematic(titlePath(road), 72, { loop: true, blend: 0.001 });
+    const tc = this._titleCam = new TitleCamera(road);
+    const freeze = titleFreezeT(); // ?titleT=0..1 holds the title camera at that point of the loop (screenshots)
+    rig.cinematic((t01, pos, target, ctx) => {
+      const r = tc.pose((freeze ?? t01) * tc.total, pos, target);
+      if (this.state === 'title') { try { ctx.post?.fadeBlack?.(r.fade); } catch {} }
+      return { fov: r.fov };
+    }, tc.total, { loop: true, blend: 0.001 });
+  }
+
+  /** Title frames: validate the camera path once scene queries work (physics has stepped). */
+  _updateTitle() {
+    const tc = this._titleCam;
+    if (!tc || tc.solved || (this.ctx.time?.frame ?? 0) < 4) return;
+    try {
+      const r = tc.solve(this.ctx);
+      if (this.ctx.flags?.debug) console.info('[game] title camera clearance', JSON.stringify(r));
+    } catch (e) { tc.solved = true; console.warn('[game] title camera check', e); }
   }
 
   _onStart(p) {
     if (this.state !== 'title') return;
     this.playTime = 0;
+    // the title's dip-to-black is cleared when the intro is set up (under the HUD fade), or right away on autostart
+    if (p?.auto) { try { this.ctx.post?.fadeBlack?.(0); } catch {} }
     const skip = this.ctx.flags?.skip;
     // Rapier scene queries are only valid after a physics step: apply once a few frames have run
     this._pendingSkip = skip && CHECKPOINTS[skip] ? skip : 'intro';
@@ -620,8 +638,10 @@ export default class Sequence {
       this.enterCar({ snap: true, silent: true });
     }
     ctx.cameraRig?.snap?.();
+    ctx.cameraRig?.focusOff?.();
     ctx.interact?.lock?.(0.5);
     ctx.hud?.damageVignette?.(0);
+    try { ctx.hud?.hideHud?.(false); ctx.hud?.letterbox?.(null); } catch {}
     this._setState(c.state);
     if (car && c.state === 'intro') car.setControlsEnabled?.(true);
     this._refreshObjective();
@@ -720,7 +740,8 @@ export default class Sequence {
     this._startSlowmo(this.tune.winSlowmo, 2.4);
     const time = ctx.hud?.playTime ?? this.playTime;
     this.winTime = time;
-    this._say('...', 1.5);
+    // the last beat plays like a film: HUD away, letterbox in, silence (no subtitle) while the portal swallows the car
+    try { ctx.hud?.subtitle?.(null); ctx.hud?.hideHud?.(true); ctx.hud?.letterbox?.(true); } catch {}
     this._objective('');
     ctx.events?.emit?.('win', { time });
     this._after(1.6, () => {
@@ -767,12 +788,14 @@ export default class Sequence {
     if (this._pendingSkip && (ctx.time.frame ?? 99) > 3 && this._rt >= (this._pendingAt || 0)) {
       const name = this._pendingSkip; this._pendingSkip = null;
       ctx.cameraRig?.stopCinematic?.(false);
+      try { ctx.post?.fadeBlack?.(0); } catch {}
       if (name === 'intro') this._beginIntro();
       else { this.applyCheckpoint(name); }
       if (!this._pendingAuto) { try { ctx.hud?.fade?.(false, 1.2); } catch {} }
       return;
     }
     if (this._pendingSkip) return;
+    if (this.state === 'title') { this._updateTitle(); return; }
 
     // hatchet in hand while it is useful; planks slow you down
     const inv = this.inventory;
@@ -859,6 +882,11 @@ export default class Sequence {
       road.worldAt(scarS + 2, 2.5, back);
       back.y = road.pointAt(scarS, _v3).y + 3.5 - t * 1.5;
       target.copy(back);
+      // rack focus, as a camera operator would: from the car to the collapsing slope behind it (subtle: the out-of-
+      // focus plane only softens, it never smears)
+      const dCar = Math.max(2, pos.distanceTo(cp)), dSlope = pos.distanceTo(back);
+      const rack = smooth01(0.08, 0.5, t);
+      rig.focusOn?.(dCar + (dSlope - dCar) * rack, { range: 55, hold: 0.2, attack: 0.3, release: 0.8, force: true });
       return { fov: 58 };
     }, 3.4, { blend: 0.25 }).then(() => {
       if (!hadAuto && car.autopilot && this.state === 'intro') car.autopilot = prev || null;
@@ -1077,28 +1105,147 @@ const CHECKPOINTS = {
 };
 
 // ================================================================================================= title camera
-// Three slow shots behind the title UI (hard cuts): over the drop looking at the scar, low along the wet road toward
-// the fallen tree, and a high wide over the valley toward the tunnel spur.
-function titlePath(road) {
-  const shots = [
-    { a: [68, -3.6, 4.4], b: [96, -3.4, 5.0], ta: [150, 16, 20], tb: [158, 14, 17] },
-    { a: [262, -2.4, 2.6], b: [286, -2.0, 2.2], ta: [320, 0.5, 1.2], tb: [330, 0.5, 1.0] },
-    { a: [640, -70, 42], b: [720, -66, 46], ta: [980, 10, 10], tb: [1060, 10, 10] },
-  ];
-  const pa = new THREE.Vector3(), pb = new THREE.Vector3();
-  return (t, outPos, outTarget) => {
-    const n = shots.length;
-    const f = clamp(t, 0, 0.99999) * n;
-    const i = Math.floor(f), u = f - i;
-    const S = shots[i];
-    const k = u * u * (3 - 2 * u) * 0.35 + u * 0.65;
-    const lerp3 = (a, b) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
-    const P = lerp3(S.a, S.b), Tt = lerp3(S.ta, S.tb);
-    road.worldAt(P[0], P[1], pa); pa.y = road.pointAt(P[0], pb).y + P[2];
-    road.worldAt(Tt[0], Tt[1], outTarget); outTarget.y = road.pointAt(Tt[0], pb).y + Tt[2];
-    outPos.copy(pa);
-    // slight handheld drift
-    outPos.x += Math.sin(t * 40) * 0.15; outPos.y += Math.sin(t * 57 + 1) * 0.1;
-    return { fov: 55 };
-  };
+// The opening behind the title UI: three slow moves, like the first minute of a film, joined by short dips to black
+// (post.fadeBlack, which sits under the title text so the wordmark stays up).
+//   1. a drone pan over the misty valley, from the cloud-filled valley round to the road cut into the forested face;
+//   2. a slow push along the wet road under the landslide scar (puddles mirroring the spruce on the valley edge);
+//   3. the rain-soaked roadworks from the outer edge of the pull-off (lamp lit, barrier line, the cut and the mist).
+// Composition rules: the left third stays calm for the wordmark (mist, sky or dark rock), the horizon is level (no roll,
+// pitch within a few degrees), and nothing leafy comes near the lens. Camera keys are road-relative [s, d, h above the
+// centreline], so the moves follow the road's own curvature. At the first title frames the whole path is checked
+// against the live tree list (vegetation.trees.data: one cone per crown, sized from impostors.json) and the ground
+// (physics ray), and a key that comes within the shot's clearance is nudged away (TitleCamera.solve).
+const TITLE_SHOTS = [
+  { name: 'valley', dur: 24, fov: 42, clear: 30, pan: true, drift: 0.35,
+    cam: [[660, -95, 36], [585, -78, 30]], tgt: [[470, -240, -36], [300, -25, -4]] },
+  { name: 'road', dur: 20, fov: 50, clear: 4, drift: 0.018,
+    cam: [[95, -1.25, 2.45], [108, -1.05, 2.3]], tgt: [[165, -0.6, 1.6], [180, -0.4, 1.5]] },
+  { name: 'roadworks', dur: 20, fov: 47, clear: 5, drift: 0.018,
+    cam: [[376, -12.8, 2.5], [388, -12.0, 2.3]], tgt: [[408, -2.2, 1.0], [414, -2.6, 1.0]] },
+];
+const TITLE_DIP = 0.9;   // s of fade at each end of a shot
+
+export class TitleCamera {
+  constructor(road, shots = TITLE_SHOTS) {
+    this.road = road;
+    this.shots = shots.map((S) => ({ ...S, cam: S.cam.map((k) => k.slice()), tgt: S.tgt.map((k) => k.slice()) }));
+    let t = 0;
+    for (const S of this.shots) { S.start = t; t += S.dur; }
+    this.total = t;
+    this.solved = false;
+    this.report = null;
+    this._a = new THREE.Vector3(); this._b = new THREE.Vector3(); this._c = new THREE.Vector3(); this._d = new THREE.Vector3();
+    this._tmp = new THREE.Vector3();
+    this._q = new THREE.Quaternion(); this._q2 = new THREE.Quaternion();
+  }
+
+  /** World point of a road-relative key [s, d, h above the centreline]. */
+  at(k, out = new THREE.Vector3()) {
+    this.road.worldAt(k[0], k[1], out);
+    out.y = this.road.pointAt(k[0], this._tmp).y + k[2];
+    return out;
+  }
+
+  shotAt(time) {
+    const t = ((time % this.total) + this.total) % this.total;
+    for (const S of this.shots) if (t < S.start + S.dur) return { S, u: (t - S.start) / S.dur, t };
+    const S = this.shots[this.shots.length - 1];
+    return { S, u: 1, t };
+  }
+
+  /** Camera pose at `time` seconds into the loop. Returns {fov, fade, shot}. */
+  pose(time, outPos, outTarget) {
+    const { S, u, t } = this.shotAt(time);
+    // near-constant speed (a dolly/drone move is already moving when the shot fades in), a touch of ease at the ends
+    const k = u * 0.75 + u * u * (3 - 2 * u) * 0.25;
+    const L = (a, b) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+    this.at(L(S.cam[0], S.cam[1]), outPos);
+    if (S.pan) {
+      // a pan turns at an even angular rate: slerp the view direction, not the look-at point
+      const ca = this.at(S.cam[0], this._a), da = this.at(S.tgt[0], this._c).sub(ca).normalize();
+      const cb = this.at(S.cam[1], this._b), db = this.at(S.tgt[1], this._d).sub(cb).normalize();
+      this._q.setFromUnitVectors(da, db);
+      const q = this._q2.identity().slerp(this._q, k);
+      outTarget.copy(da).applyQuaternion(q).multiplyScalar(200).add(outPos);
+    } else {
+      this.at(L(S.tgt[0], S.tgt[1]), outTarget);
+    }
+    // gimbal float: slow, tiny (sub-centimetre rotation on the ground shots); never a handheld shake
+    const a = S.drift ?? 0.02;
+    outPos.x += Math.sin(t * 0.37 + 0.3) * a; outPos.y += Math.sin(t * 0.29 + 1.1) * a * 0.6; outPos.z += Math.sin(t * 0.23 + 2.0) * a;
+    const ta = a * 2.2;
+    outTarget.x += Math.sin(t * 0.31 + 0.7) * ta; outTarget.y += Math.sin(t * 0.19 + 2.3) * ta * 0.5; outTarget.z += Math.sin(t * 0.27 + 1.4) * ta;
+    const into = t - S.start, left = S.start + S.dur - t;
+    const fade = 1 - smooth01(0, TITLE_DIP, into) * smooth01(0, TITLE_DIP, left);
+    return { fov: S.fov, fade, shot: S.name };
+  }
+
+  /**
+   * Checks every shot against the trees and the ground and nudges keys that come too close. Tree = cone crown
+   * (base 12 % up the stem, radius width/2 x scale) from vegetation.trees.data [x,y,z,scale,rotY,variant]; a ground
+   * shot moves sideways away from the offending tree (toward the road centre) and a little up, an aerial shot rises.
+   */
+  solve(ctx) {
+    const f = ctx.vegetation?.trees;
+    const data = f?.data, n = f?.count || 0;
+    const vars = f?.meta?.variants;
+    const VH = vars ? vars.map((v) => v.height) : [27.1, 26.3, 31.4, 29.6, 15.8];
+    const VW = vars ? vars.map((v) => v.width) : [9.0, 8.8, 10.5, 9.9, 5.3];
+    const phys = ctx.physics;
+    const P = new THREE.Vector3();
+    const treeClear = (p) => {
+      let best = Infinity, bi = -1;
+      if (!data) return { best, bi };
+      for (let i = 0; i < n; i++) {
+        const o = i * 6, sc = data[o + 3];
+        if (!(sc > 0)) continue;
+        const dx = p.x - data[o], dz = p.z - data[o + 2];
+        if (Math.abs(dx) > 40 || Math.abs(dz) > 40) continue;
+        const v = data[o + 5] | 0, H = (VH[v] ?? 27) * sc, R = (VW[v] ?? 9) * 0.5 * sc * 0.9, y0 = 0.12 * H;
+        const dh = Math.hypot(dx, dz), y = p.y - data[o + 1];
+        const c = y >= H ? Math.hypot(dh, y - H) : y <= y0 ? dh - R : dh - R * (1 - (y - y0) / (H - y0));
+        if (c < best) { best = c; bi = i; }
+      }
+      return { best, bi };
+    };
+    const report = [];
+    for (const S of this.shots) {
+      let worst = Infinity, moved = 0;
+      for (let iter = 0; iter < 12; iter++) {
+        worst = Infinity;
+        let fix = null;
+        for (let j = 0; j <= 10; j++) {
+          const k = j / 10;
+          const key = S.cam[0].map((x, m) => x + (S.cam[1][m] - x) * k);
+          this.at(key, P);
+          const { best, bi } = treeClear(P);
+          let ground = Infinity;
+          if (S.clear < 10 && phys?.groundHeight) {
+            const gy = phys.groundHeight(P.x, P.z, P.y + 3, 30);
+            if (gy != null && isFinite(gy)) ground = P.y - gy;
+          }
+          if (best < worst) worst = best;
+          if (best < S.clear && !fix) fix = { bi, k };
+          if (ground < 1.3 && !fix) fix = { ground: true, k };
+        }
+        if (!fix) break;
+        moved++;
+        for (const key of S.cam) {
+          if (fix.ground || S.clear >= 10) { key[2] += S.clear >= 10 ? 4 : 0.3; continue; }
+          // sideways away from the tree, in road space
+          const pr = this.road.project(P.set(data[fix.bi * 6], data[fix.bi * 6 + 1], data[fix.bi * 6 + 2]), {});
+          const away = Math.sign(key[1] - pr.d) || 1;
+          if (Math.abs(key[1] + away * 0.35) <= 3.2 || S.name === 'roadworks') key[1] += away * 0.35; else key[2] += 0.25;
+        }
+      }
+      report.push({ shot: S.name, clearance: +worst.toFixed(1), adjusted: moved });
+    }
+    this.solved = true;
+    this.report = report;
+    return report;
+  }
+}
+
+function titleFreezeT() {
+  try { const v = parseFloat(new URLSearchParams(location.search).get('titleT')); return isFinite(v) ? v : null; } catch { return null; }
 }

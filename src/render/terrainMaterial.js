@@ -47,8 +47,10 @@ async function bitmap(path, size) {
   });
 }
 
-/** Builds (once) and returns {alb, nrm, avg: Float32Array(n*3) linear average albedo per layer}. */
-export function loadTerrainArrays(ctx, size = 1024) {
+/** Builds (once) and returns {alb, nrm, avg: Float32Array(n*3) linear average albedo per layer}.
+ *  (LOWEND) Low loads 512 px scans (assets/q/lo) and renders at ~830x470: a 1024 array would only upscale them
+ *  (4x the memory, no extra detail), so its layers are 512². Medium/High/Ultra keep 1024. */
+export function loadTerrainArrays(ctx, size = ctx.config?.quality?.key === 'low' ? 512 : 1024) {
   if (!_arrays) _arrays = buildArrays(ctx, size);
   return _arrays;
 }
@@ -130,6 +132,38 @@ float th_fbm(vec2 p) {
   return s / 0.9375;
 }
 `;
+
+// (LOWEND) Texture-backed value noise for the lite shaders: a 256² R8 table of th_hash at the integer lattice, read
+// with one bilinear fetch at (i + smoothstep(f) + 0.5) / 256. That is exactly th_vnoise's interpolation (to 8-bit
+// precision), with the lattice repeating every 256 cells, for one texture tap instead of four ALU hashes.
+let _noiseTex = null;
+export function noiseTexture() {
+  if (_noiseTex) return _noiseTex;
+  const N = 256, d = new Uint8Array(N * N);
+  const fr = (x) => x - Math.floor(x), f32 = Math.fround;
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    let px = fr(f32(x * 123.34)), py = fr(f32(y * 456.21));
+    const dd = px * (px + 45.32) + py * (py + 45.32);
+    px += dd; py += dd;
+    d[y * N + x] = Math.round(fr(px * py) * 255);
+  }
+  const t = new THREE.DataTexture(d, N, N, THREE.RedFormat, THREE.UnsignedByteType);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.minFilter = t.magFilter = THREE.LinearFilter;
+  t.generateMipmaps = false;
+  t.name = 'terrain.noise256';
+  t.needsUpdate = true;
+  return (_noiseTex = t);
+}
+export const VNOISE_ALU = `float th_vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(th_hash(i), th_hash(i + vec2(1.0, 0.0)), u.x), mix(th_hash(i + vec2(0.0, 1.0)), th_hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}`;
+export const VNOISE_TEX = `uniform sampler2D uNoise;
+float th_vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return textureLod(uNoise, (i + u + 0.5) * (1.0 / 256.0), 0.0).r;
+}`;
 
 const NL = LAYERS.length;
 
@@ -697,6 +731,97 @@ void th_splat() {
 }
 `;
 
+// ---------------------------------------------------------------------------------------------
+// LITE variants for the Medium (1) and Low (2) presets (LOWEND pass). They are derived from FRAG_PARS by exact
+// text substitution, so the Ultra/High shader source stays byte-identical to the full-quality one. A substitution
+// that no longer matches (FRAG_PARS edited) is reported once and skipped: that variant then just costs more.
+//   both : 3 (Medium) / 2 (Low) fBm octaves; only the far-look layers that carry weight are sampled (weights remapped
+//          so the skips are seamless); the 5x far-tile cross-fade runs over 560-640 m instead of 450-800 m; the
+//          second splat layer is skipped below 10 % weight (its height-blend share there is < 2 %) and faded in over
+//          10-20 %, so the skip never pops.
+//   Low  : the rock-face water (ink stripes, seeps, iron, calcite) evaluates one joint column and two source rows
+//          instead of a 3x2 neighbourhood; sharper biplanar weights (the second projection runs only in a narrow
+//          band around 45 deg); no sheet-flow bands, no blasting half-casts and no soaked halo around the falls.
+// ---------------------------------------------------------------------------------------------
+const SEEP_LITE = /* glsl */`
+// (lite) th_seep over one joint column: the neighbour columns are replaced by a soft window at the cell edges
+vec4 th_seepL(float u, float y, float seed) {
+  vec4 r = vec4(0.0);
+  const float CW = 2.6, RH = 7.0;
+  float ci = floor(u / CW), ri = floor(y / RH);
+  float fu = u / CW - ci;
+  float win = smoothstep(0.0, 0.2, fu) * smoothstep(1.0, 0.8, fu);
+  for (int j = 0; j <= 1; j++) {
+    float row = ri + float(j);
+    vec2 id = vec2(ci, row) + seed;
+    float h0 = th_hash(id);
+    if (h0 > 0.7) continue;
+    float h1 = th_hash(id + 7.13), h2 = th_hash(id + 3.71);
+    float y0 = (row + 0.35 + 0.6 * h1) * RH;
+    float dy = y0 - y;
+    float len = 2.5 + 11.0 * h2;
+    if (dy < -0.3 || dy > len + 2.0) continue;
+    float h3 = th_hash(id + 11.9);
+    float wander = (th_vnoise(vec2(y * 0.45, ci * 3.1 + seed)) - 0.5) * (0.3 + 0.03 * dy);
+    float cx = (ci + 0.32 + 0.36 * h3) * CW + wander;
+    float wI = (0.1 + 0.34 * h1 * h1) * (1.0 + 0.07 * dy);
+    float wS = (0.03 + 0.1 * h2) * (1.0 + 0.06 * dy);
+    float x = u - cx;
+    float fade = smoothstep(-0.3, 0.25, dy) * (1.0 - smoothstep(len, len + 2.0, dy)) * win;
+    float xi = abs(x) / max(wI, 0.05);
+    float ink = exp(-xi * xi) * fade * step(0.18, h0) * smoothstep(1.3, 0.5, xi + 0.35 * fract(h2 * 13.7 + y * 0.37));
+    float sp = exp(-x * x / (wS * wS)) * fade * step(h0, 0.55);
+    r.x = max(r.x, ink * (0.45 + 0.55 * h2));
+    r.y = max(r.y, sp);
+    r.z = max(r.z, exp(-xi * xi * 0.25) * fade * step(0.8, fract(h3 * 7.3)) * 0.8);
+    r.w = max(r.w, exp(-xi * xi / 0.6) * fade * step(0.9, fract(h1 * 5.7)) * smoothstep(0.5, 2.5, dy));
+  }
+  return r;
+}
+`;
+const _liteWarned = new Set();
+function subst(src, pairs, tag) {
+  for (const [a, b] of pairs) {
+    if (!src.includes(a)) {
+      if (!_liteWarned.has(tag + a)) { _liteWarned.add(tag + a); console.warn(`[terrain] ${tag}: shader substitution not found, skipped:`, a.slice(0, 60)); }
+      continue;
+    }
+    src = src.split(a).join(b);
+  }
+  return src;
+}
+// feature set per lite level (a string such as 'o2 seep bp nosheet nohc nohalo' may be passed for A/B tests)
+const LITE_FEATURES = { 1: 'o3 seep ntex', 2: 'o2 seep bp nosheet nohc nohalo ntex' };
+const _liteCache = {};
+export function terrainFragLite(level) {
+  const key = LITE_FEATURES[level] ?? String(level);
+  if (_liteCache[key]) return _liteCache[key];
+  const f = new Set(key.split(/\s+/));
+  const pairs = [
+    ['for (int i = 0; i < 4; i++) { s += a * th_vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p; a *= 0.5; }\n  return s / 0.9375;',
+      f.has('o4') ? 'for (int i = 0; i < 4; i++) { s += a * th_vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p; a *= 0.5; }\n  return s / 0.9375;' : f.has('o2') ? 'for (int i = 0; i < 2; i++) { s += a * th_vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p; a *= 0.5; }\n  return s / 0.75;'
+        : 'for (int i = 0; i < 3; i++) { s += a * th_vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p; a *= 0.5; }\n  return s / 0.875;'],
+    ['    if (b2 > 0.02) {', '    if (b2 > 0.1) {'],
+    ['      float bs = max(ba + bb, 1e-4); ba /= bs; bb /= bs;',
+      '      float bs = max(ba + bb, 1e-4); ba /= bs; bb /= bs;\n      bb *= smoothstep(0.1, 0.2, b2); ba = 1.0 - bb;'],
+    ['    float kfar = smoothstep(450.0, 800.0, dist);\n    float rk = clamp(rock * rest, 0.0, 1.0);\n    vec4 Ag; vec3 Ng; float Rg, Og;\n    th_layerF(2.0, 21.0, 0.8, p, dpx, dpy, n, b, kfar, Ag, Ng, Rg, Og);\n    vec3 fa = Ag.rgb; vec3 fn = Ng; float fr = Rg, fo = Og;\n    if (rk > 0.02) {',
+      '    float kfar = smoothstep(560.0, 640.0, dist);\n    float wmL = clamp((mudW + gravW - 0.04) / 0.92, 0.0, 1.0);\n    float rk = clamp((rock * rest - 0.04) / 0.93, 0.0, 1.0);\n    vec4 Ag = vec4(0.08, 0.08, 0.07, 0.5); vec3 Ng = n; float Rg = 0.9, Og = 1.0;\n    if (rk < 1.0 && wmL < 1.0) th_layerF(2.0, 21.0, 0.8, p, dpx, dpy, n, b, kfar, Ag, Ng, Rg, Og);\n    vec3 fa = Ag.rgb; vec3 fn = Ng; float fr = Rg, fo = Og;\n    if (rk > 0.0 && wmL < 1.0) {'],
+    ['    if (mudW + gravW > 0.02) {\n      vec4 Am;', '    if (wmL > 0.0) {\n      vec4 Am;'],
+    ['      float wm = clamp(mudW + gravW, 0.0, 1.0);', '      float wm = wmL;'],
+  ];
+  if (f.has('ntex')) pairs.push([VNOISE_ALU, VNOISE_TEX]);
+  if (f.has('bp')) pairs.push(['  w = w * w;\n', '  w = w * w; w = w * w;\n']);
+  if (f.has('seep')) pairs.push(
+    ['    if (hw.x > 0.02) sw += th_seep(p.x, p.y, 0.0) * hw.x;\n    if (hw.y > 0.02) sw += th_seep(p.z, p.y, 17.0) * hw.y;',
+      '    hw = clamp((hw - 0.2) / 0.6, 0.0, 1.0); hw /= max(hw.x + hw.y, 1e-4);\n    if (hw.x > 0.0) sw += th_seepL(p.x, p.y, 0.0) * hw.x;\n    if (hw.y > 0.0) sw += th_seepL(p.z, p.y, 17.0) * hw.y;'],
+    ['vec2 th_halfcast(float u, float y, float seed) {', SEEP_LITE + '\nvec2 th_halfcast(float u, float y, float seed) {'],
+  );
+  if (f.has('nosheet')) pairs.push(['    if (uFx * uFxv.x > 0.5 && dist < 150.0) {', '    if (false) {']);
+  if (f.has('nohc')) pairs.push(['  if (uFx * uFxv.z > 0.5 && face > 0.3 && dist < 45.0 && slope > 0.75) {', '  if (false) {']);
+  if (f.has('nohalo')) pairs.push(['  if (uFx * uFxv.y > 0.5 && washZ < 0.5 && dist < 200.0', '  if (false && washZ < 0.5 && dist < 200.0']);
+  return (_liteCache[key] = subst(FRAG_PARS, pairs, 'lite ' + key));
+}
+
 const VERT_PARS = /* glsl */`
 attribute vec4 masks;
 varying vec4 vMasks;
@@ -706,18 +831,28 @@ varying vec3 vWNrm;
 
 // near-look -> far-look blend distances per quality preset (m)
 const LOD_DIST = { Ultra: [110, 260], High: [85, 210], Medium: [50, 125], Low: [35, 90] };
+// (LOWEND) the lite presets blend the two looks over a narrower band: fewer pixels evaluate both
+const LOD_DIST_LITE = { Medium: [58, 100], Low: [40, 66] };
+/** Shader tier of the terrain / road materials: 0 = full (Ultra, High), 1 = Medium, 2 = Low. ?terrainLite=n overrides. */
+export function liteLevel(ctx) {
+  const o = new URLSearchParams(location.search).get('terrainLite');
+  if (o != null && o !== '') return Math.max(0, Math.min(2, +o || 0));
+  const k = ctx.config?.quality?.key;
+  return k === 'low' ? 2 : k === 'medium' ? 1 : 0;
+}
 
 /**
  * Create the terrain material. opts: {far: bool (far-only look), antiTile: bool, lodNear, lodFar}
  * Returns a MeshStandardMaterial with .userData.update(dt) that tracks ctx.env.wetness.
  */
 export async function createTerrainMaterial(ctx, opts = {}) {
+  let lite = liteLevel(ctx);
   const arr = await loadTerrainArrays(ctx);
   const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 0 });
   const avg = [];
   for (let i = 0; i < NL; i++) avg.push(new THREE.Vector3(arr.avg[i * 3], arr.avg[i * 3 + 1], arr.avg[i * 3 + 2]));
   const q = ctx.config?.quality?.name;
-  const ld = LOD_DIST[q] || LOD_DIST.High;
+  const ld = (lite && LOD_DIST_LITE[q]) || LOD_DIST[q] || LOD_DIST.High;
   const uniforms = {
     uAlb: { value: arr.alb }, uNrm: { value: arr.nrm },
     uTile: { value: TILE.slice() }, uNStr: { value: NSTR.slice() }, uAvg: { value: avg },
@@ -725,7 +860,7 @@ export async function createTerrainMaterial(ctx, opts = {}) {
     uWet: { value: ctx.env?.wetness ?? 0.75 }, uTime: { value: 0 },
     uLodDist: { value: new THREE.Vector2(opts.lodNear ?? ld[0], opts.lodFar ?? ld[1]) },
     uGap: { value: new THREE.Vector4(0, -1e4, 0, 0) }, uGapT: { value: new THREE.Vector2(1, 0) },
-    uFx: { value: 1 }, uFxv: { value: new THREE.Vector4(1, 1, 1, 1) },
+    uFx: { value: 1 }, uFxv: { value: new THREE.Vector4(1, 1, 1, 1) }, uNoise: { value: noiseTexture() },
     uFallMin: { value: new THREE.Vector3(1e9, 1e9, 1e9) }, uFallMax: { value: new THREE.Vector3(-1e9, -1e9, -1e9) },
     uFallA: { value: Array.from({ length: 16 }, () => new THREE.Vector4(0, -1e4, 0, 0.1)) },
     uFallN: { value: 0 },
@@ -752,7 +887,7 @@ export async function createTerrainMaterial(ctx, opts = {}) {
         vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
         vWNrm = normalize(mat3(modelMatrix) * objectNormal);`);
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', '#include <common>\n' + FRAG_PARS)
+      .replace('#include <common>', '#include <common>\n' + (lite ? terrainFragLite(lite) : FRAG_PARS))
       .replace('#include <map_fragment>', 'th_splat();\n diffuseColor.rgb = thAlbedo;')
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = thRough;')
       .replace('#include <normal_fragment_maps>', 'normal = normalize((viewMatrix * vec4(thNormalW, 0.0)).xyz);')
@@ -783,8 +918,11 @@ export async function createTerrainMaterial(ctx, opts = {}) {
         }
       }`);
   };
-  m.customProgramCacheKey = () => `terrain3|${opts.far ? 'far' : 'near'}|${antiTile ? 'at' : ''}`;
+  m.customProgramCacheKey = () => `terrain3|${opts.far ? 'far' : 'near'}|${antiTile ? 'at' : ''}` + (lite ? `|lite:${lite}` : '');
   m.userData.uniforms = uniforms;
+  m.userData.lite = lite;
+  /** debug / A-B: switch the shader tier at runtime (recompiles once). */
+  m.userData.setLite = (n) => { if (n !== lite) { lite = n; m.userData.lite = n; m.needsUpdate = true; } };
   m.userData.update = (dt) => {
     uniforms.uWet.value = ctx.env?.wetness ?? uniforms.uWet.value;
     uniforms.uTime.value += dt;

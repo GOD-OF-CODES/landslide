@@ -8,6 +8,7 @@
 // Every method is safe to call at any time (before boot, with a missing ctx, with other systems absent).
 import { ICONS, ITEM_NAMES } from './icons.js';
 import { Cluster } from './gauges.js';
+import { DOWNLOAD_MB, QUALITY_INFO } from './gate.js';
 
 const SETTINGS_KEY = 'landslide.settings';
 const DEFAULTS = { sensitivity: 1, invertY: false, volume: 0.8, subtitles: true };
@@ -35,6 +36,12 @@ const LOAD_LABELS = {
 };
 const LOAD_ORDER = ['hud', 'env', 'terrain', 'vegetation', 'props', 'landslide', 'particles', 'car', 'player',
   'cameraRig', 'audio', 'interact', 'game', 'post'];
+// Loading progress model. Downloads are counted in bytes (PerformanceObserver 'resource' entries under /assets/,
+// against the preset's measured total DOWNLOAD_MB from gate.js), system inits by
+// count, and the final shader compile (no progress events of its own) by a time constant per preset.
+const SYS_S = { low: 3, medium: 3.5, high: 4, ultra: 4.5 };      // system inits after the downloads (s, M1)
+const COMPILE_S = { low: 1.2, medium: 1.8, high: 2.4, ultra: 3.0 }; // compileAsync + warm-up render (s, M1)
+const W_DL = 0.72, W_SYS = 0.16, W_COMPILE = 0.12;
 
 const CAUSES = {
   boulder: ['Crushed by rockfall', 'A boulder the size of a car came down the gully. There was no time to hear it.'],
@@ -121,7 +128,7 @@ export default class Hud {
       </div>
       <div class="prompt">
         <div class="key"><svg class="ring" viewBox="0 0 44 44"><circle cx="22" cy="22" r="19.5" class="r-bg"/><circle cx="22" cy="22" r="19.5" class="r-fg"/></svg><span class="key-cap">E</span></div>
-        <div class="prompt-text"></div>
+        <div class="prompt-text"><span class="p-k">Hold</span><span class="p-l"></span></div>
       </div>
       <div class="inventory"></div>
       <div class="subtitle" aria-live="polite"><span class="sub-speaker"></span><span class="sub-text"></span></div>`;
@@ -132,7 +139,7 @@ export default class Hud {
     this.$ = {
       vignette: q('.vignette'), objective: q('.objective'), objText: q('.obj-text'), toasts: q('.toasts'),
       reticle: q('.reticle'), stamina: q('.stamina'), stFg: q('.st-fg'), prompt: q('.prompt'),
-      keyCap: q('.key-cap'), ring: q('.ring'), ringFg: q('.r-fg'), promptText: q('.prompt-text'),
+      keyCap: q('.key-cap'), ring: q('.ring'), ringFg: q('.r-fg'), promptText: q('.prompt-text'), promptLabel: q('.prompt-text .p-l'),
       inventory: q('.inventory'), subtitle: q('.subtitle'), subSpeaker: q('.sub-speaker'), subText: q('.sub-text'),
     };
 
@@ -180,10 +187,12 @@ export default class Hud {
       </div>
       <div class="load-foot">
         <div class="load-row"><span class="load-label">Preparing</span><span class="load-pct">0%</span></div>
-        <div class="load-bar"><i></i></div>
+        <div class="load-bar"><i></i><b></b></div>
+        <div class="load-meta"><span class="load-q"></span><span class="load-eta"></span></div>
         <div class="load-tip"></div>
       </div>`;
-    this.$load = { bar: L.querySelector('.load-bar i'), pct: L.querySelector('.load-pct'), label: L.querySelector('.load-label'), tip: L.querySelector('.load-tip') };
+    this.$load = { bar: L.querySelector('.load-bar i'), barBox: L.querySelector('.load-bar'), pct: L.querySelector('.load-pct'), label: L.querySelector('.load-label'),
+      tip: L.querySelector('.load-tip'), q: L.querySelector('.load-q'), eta: L.querySelector('.load-eta') };
     this._tipIdx = Math.floor(Math.random() * TIPS.length);
     this.$load.tip.textContent = TIPS[this._tipIdx];
     return L;
@@ -209,7 +218,7 @@ export default class Hud {
         <p class="t-tag">Somewhere above the valley, the mountain has started to move.</p>
       </div>
       <div class="panel-host"></div>
-      <div class="t-foot"><span>Headphones recommended</span><span class="sep"></span><span class="q-note"></span></div>`;
+      <div class="t-foot"><span>Headphones recommended</span><span class="sep"></span><span class="q-note"></span><button type="button" class="q-change">Change</button></div>`;
     const col = S.querySelector('.title-col');
     col.appendChild(this._menu([
       ['start', 'Start', () => this._startClicked(), 'primary'],
@@ -217,7 +226,14 @@ export default class Hud {
       ['controls', 'Controls', (b) => this._togglePanel(S, 'controls', b)],
       ['credits', 'Credits', (b) => this._togglePanel(S, 'credits', b)],
     ]));
-    S.querySelector('.q-note').textContent = `Quality: ${this.ctx.config?.quality?.name ?? 'High'}`;
+    S.querySelector('.q-note').textContent = `Quality: ${this.ctx.config?.quality?.name ?? 'Low'}`;
+    // "Change": opens Settings with the quality selector focused (applying it reloads without the pre-load screen)
+    S.querySelector('.q-change').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const btn = S.querySelector('.m-item[data-id="settings"]');
+      if (!(this._openPanel === 'settings' && this._panelScreen === S)) this._togglePanel(S, 'settings', btn);
+      setTimeout(() => this.panels.settings.querySelector('.seg [aria-checked="true"]')?.focus({ preventScroll: true }), 60);
+    });
     return S;
   }
 
@@ -273,30 +289,51 @@ export default class Hud {
 
   _buildSettings() {
     const P = el('section', 'panel settings');
-    const cur = this.ctx.config?.qualityKey ?? 'high';
+    const cur = this.ctx.config?.qualityKey ?? 'low';
+    const name = (k) => QUALITY_INFO?.[k]?.title || k[0].toUpperCase() + k.slice(1);
     P.innerHTML = `<h3>Settings</h3>
-      <div class="row"><label>Graphics quality</label>
-        <div class="seg" role="radiogroup">${QUALITY_KEYS.map((k) => `<button type="button" role="radio" data-q="${k}" aria-checked="${k === cur}">${k[0].toUpperCase() + k.slice(1)}</button>`).join('')}</div>
+      <div class="row q-row"><label>Graphics quality</label>
+        <div class="seg" role="radiogroup" aria-label="Graphics quality">${QUALITY_KEYS.map((k) => `<button type="button" role="radio" data-q="${k}" aria-checked="${k === cur}">${name(k)}</button>`).join('')}</div>
       </div>
+      <div class="q-desc"></div>
       <div class="apply-row"><span class="apply-note"></span><button type="button" class="btn-apply">Apply and reload</button></div>
       <div class="row"><label for="ls-sens">Mouse sensitivity</label><div class="rng"><input id="ls-sens" type="range" min="0.25" max="3" step="0.05"><output class="val-sens"></output></div></div>
       <div class="row"><label>Invert vertical look</label><button type="button" class="tog" role="switch" data-k="invertY"><i></i></button></div>
       <div class="row"><label for="ls-vol">Master volume</label><div class="rng"><input id="ls-vol" type="range" min="0" max="100" step="1"><output class="val-vol"></output></div></div>
       <div class="row"><label>Subtitles</label><button type="button" class="tog" role="switch" data-k="subtitles"><i></i></button></div>`;
     let pending = null;
-    const applyRow = P.querySelector('.apply-row'), note = P.querySelector('.apply-note');
-    P.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => {
+    const applyRow = P.querySelector('.apply-row'), note = P.querySelector('.apply-note'), desc = P.querySelector('.q-desc');
+    const describe = (k) => {
+      const mb = DOWNLOAD_MB?.[k];
+      desc.innerHTML = `<b>${esc(name(k))}${k === cur ? ' \u00b7 current' : ''}</b>${mb ? ` <span>${mb} MB</span>` : ''}<br>${esc(QUALITY_INFO?.[k]?.blurb || '')}`;
+    };
+    describe(cur);
+    const segBtns = [...P.querySelectorAll('.seg button')];
+    const choose = (b) => {
       pending = b.dataset.q === cur ? null : b.dataset.q;
-      P.querySelectorAll('.seg button').forEach((o) => o.setAttribute('aria-checked', String(o === b)));
+      segBtns.forEach((o) => o.setAttribute('aria-checked', String(o === b)));
       applyRow.classList.toggle('on', !!pending);
+      describe(b.dataset.q);
       note.textContent = this.started ? 'Reloading restarts the game.' : 'The game reloads to apply this.';
-    }));
+    };
+    segBtns.forEach((b, i) => {
+      b.addEventListener('click', () => choose(b));
+      // arrow keys move within the radio group (Up/Down still move between menu rows)
+      b.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        e.preventDefault(); e.stopPropagation();
+        const n = segBtns[Math.max(0, Math.min(segBtns.length - 1, i + (e.key === 'ArrowRight' ? 1 : -1)))];
+        n.focus({ preventScroll: true }); choose(n);
+      });
+    });
     P.querySelector('.btn-apply').addEventListener('click', () => {
       if (!pending) return;
       try { this.ctx.config?.setQuality?.(pending); } catch {}
       try { localStorage.setItem('landslide.quality', pending); } catch {}
+      // the choice is made: skip the pre-load quality screen on the reload (main.js reads this flag)
+      try { sessionStorage.setItem('landslide.gateDone', '1'); } catch {}
       const u = new URL(location.href); u.searchParams.delete('quality'); u.searchParams.delete('autostart');
-      location.href = u.toString();
+      this.fade(true, 0.35).then(() => { location.href = u.toString(); });
     });
     const sens = P.querySelector('#ls-sens'), vol = P.querySelector('#ls-vol');
     const sync = () => {
@@ -336,9 +373,11 @@ export default class Hud {
     const only = this.ctx.flags?.only;
     this._sysTotal = only ? Math.max(1, only.filter((k) => k !== 'hud').length) : LOAD_ORDER.length - 1;
     this._sysDone = 0; this._loadShown = 0; this._booted = false;
+    this._watchDownloads();
     on('boot:progress', (p) => {
       if (p?.key === 'hud') return;
       this._sysDone++;
+      if (this._sysDone >= this._sysTotal && !this._compileT0) this._compileT0 = performance.now();
       const idx = LOAD_ORDER.indexOf(p?.key);
       const next = LOAD_ORDER.slice(idx + 1).find((k) => !only || only.includes(k));
       this._loadLabel = this._sysDone >= this._sysTotal || !next ? 'Compiling shaders' : (LOAD_LABELS[next] || 'Loading');
@@ -374,21 +413,78 @@ export default class Hud {
 
   _isLocked() { try { return !!this.ctx.input?.locked; } catch { return false; } }
 
+  /** Byte-level download progress: every finished /assets/ response (buffered: also those that finished before the
+   *  HUD existed). Resource entries only arrive when a file completes, so _loadTick extrapolates the flow in between. */
+  _watchDownloads() {
+    const dl = this._dl = { bytes: 0, n: 0, t0: Infinity, last: 0, seen: new Set() };
+    const add = (e) => {
+      if (!e?.name || dl.seen.has(e.name) || !/\/assets\//.test(e.name)) return;
+      dl.seen.add(e.name);
+      dl.bytes += e.encodedBodySize || e.transferSize || e.decodedBodySize || 0;
+      dl.n++;
+      dl.t0 = Math.min(dl.t0, e.fetchStart || e.startTime || 0);
+      dl.last = Math.max(dl.last, e.responseEnd || performance.now());
+    };
+    try {
+      this._po = new PerformanceObserver((list) => { for (const e of list.getEntries()) add(e); });
+      this._po.observe({ type: 'resource', buffered: true });
+    } catch { this._po = null; }
+    const qk = this.ctx.config?.qualityKey;
+    this._qKey = DOWNLOAD_MB[qk] ? qk : 'low';
+    this._expBytes = DOWNLOAD_MB[this._qKey] * 1048576;
+    this._eta = null; this._etaText = ''; this._etaAt = 0;
+    const qn = this.ctx.config?.quality?.name || this._qKey;
+    if (this.$load?.q) this.$load.q.textContent = `${qn} quality`;
+  }
+
   _loadTick(now) {
     if (!this.loadEl || this._loadGone) return;
+    const dt = Math.min(0.1, Math.max(0, (now - (this._ltPrev || now)) / 1000)); this._ltPrev = now;
+    const dl = this._dl, exp = this._expBytes || 1;
+    const S = clamp01(this._sysDone / this._sysTotal);
+    // download fraction: finished bytes + the flow since the last completion (resource entries only arrive when a
+    // file is complete). The rate is bytes finished per second since the first asset request, blended with a prior
+    // of ~25 Mbit/s so two tiny early files cannot make it race ahead; the extrapolated part is capped.
+    const elapsed = dl.n ? Math.max(0, (now - dl.t0) / 1000) : 0;
+    const rate = dl.n ? (dl.bytes + 3 * 1048576) / (elapsed + 1) : 0;
+    const flow = dl.bytes + (rate > 0 ? Math.min(rate * Math.max(0, (now - dl.last) / 1000), 0.35 * Math.max(0, exp - dl.bytes)) : 0);
+    let D = clamp01(Math.min(flow, exp * 0.985) / exp);
     const pr = this.ctx.assets?.progress;
-    const assetFrac = pr && pr.total > 0 ? pr.loaded / pr.total : 0;
-    const sys = this._sysDone / this._sysTotal;
-    const target = this._booted ? 1 : Math.min(0.97, 0.04 + 0.66 * sys + 0.27 * assetFrac);
-    const t = Math.max(this._loadShown, target);
-    // ease toward target so the bar never jumps
-    this._loadShown += (t - this._loadShown) * (this._booted ? 0.2 : 0.08);
-    if (this._booted && this._loadShown > 0.995) this._loadShown = 1;
-    const pct = Math.round(this._loadShown * 100);
-    this.$load.bar.style.transform = `scaleX(${this._loadShown.toFixed(4)})`;
+    if (S >= 1 || (pr && pr.total > 20 && pr.loaded >= pr.total && S > 0.35)) D = 1; // everything is in
+    // shader compile: no events, so an exponential approach over the preset's typical duration
+    let C = 0;
+    if (this._booted) C = 1;
+    else if (this._compileT0) C = 0.93 * (1 - Math.exp(-(now - this._compileT0) / 1000 / COMPILE_S[this._qKey]));
+    const R = this._booted ? 1 : Math.min(0.985, W_DL * D + W_SYS * S + W_COMPILE * C);
+    // ease toward the real value; never backwards, and a slow creep (at most 1.5 % ahead) so it never looks frozen
+    let v = this._loadShown;
+    v += (Math.max(v, R) - v) * (1 - Math.exp(-dt * (this._booted ? 9 : 5)));
+    if (!this._booted && v < R + 0.015) v = Math.min(R + 0.015, v + dt * 0.006);
+    if (this._booted && v > 0.996) v = 1;
+    this._loadShown = v = Math.min(1, v);
+    const pct = Math.round(v * 100);
+    this.$load.bar.style.transform = `scaleX(${v.toFixed(4)})`;
     if (this.$load.pct.textContent !== pct + '%') this.$load.pct.textContent = pct + '%';
-    const label = this._booted ? 'Ready' : this._loadLabel;
+    const compiling = !this._booted && S >= 1;
+    const label = this._booted ? 'Ready' : (compiling ? 'Compiling shaders' : this._loadLabel);
     if (this.$load.label.textContent !== label) this.$load.label.textContent = label;
+    this.$load.barBox.classList.toggle('busy', compiling);
+    // quality + size while downloading, then the time estimate
+    const mb = (b) => (b / 1048576).toFixed(b < 10485760 ? 1 : 0);
+    const qn = this.ctx.config?.quality?.name || this._qKey;
+    const qText = D < 1 && dl.n > 0 ? `${qn} quality \u00b7 ${mb(Math.min(dl.bytes, exp))} / ${mb(exp)} MB` : `${qn} quality \u00b7 ${mb(exp)} MB`;
+    if (this.$load.q.textContent !== qText) this.$load.q.textContent = qText;
+    if (!this._booted && rate > 0 && dl.n >= 3 && elapsed > 1.5) {
+      const raw = (D < 1 ? Math.max(0, exp - flow) / rate : 0) + (1 - S) * SYS_S[this._qKey] * (D < 1 ? 1 : 0.8) + (1 - C) * COMPILE_S[this._qKey];
+      this._eta = this._eta == null ? raw : this._eta + (raw - this._eta) * (1 - Math.exp(-dt * 1.2));
+    }
+    if (now - this._etaAt > 900 || this._booted) {
+      this._etaAt = now;
+      const e = this._eta;
+      let t = '';
+      if (!this._booted && e != null && e >= 3.5) t = e > 90 ? `About ${Math.round(e / 60)} min left` : `About ${e > 20 ? Math.round(e / 5) * 5 : Math.round(e)} s left`;
+      if (t !== this._etaText) { this._etaText = t; this.$load.eta.textContent = t; }
+    }
     requestAnimationFrame(this._loadTick);
   }
 
@@ -414,6 +510,7 @@ export default class Hud {
     this.loadEl.classList.remove('on');
     this.loadEl.classList.add('leaving');
     clearInterval(this._tipTimer);
+    try { this._po?.disconnect(); } catch {}
     setTimeout(() => { this._loadGone = true; this.loadEl?.remove(); }, 1400);
   }
 
@@ -616,14 +713,20 @@ export default class Hud {
     text = String(text);
     if (text !== this._prompt.text) {
       this._prompt.text = text;
-      let key = 'E', label = text;
+      // "[E]  Take the jerrycan" -> key cap + label; "Hold [E]  Chop the trunk" -> key cap, a HOLD kicker + label;
+      // no [key] at all = a hint (nothing to press: no key cap, quieter type)
+      let key = null, label = text, hold = false;
       const m = /\[([^\]]{1,8})\]/.exec(text);
       if (m) { key = m[1]; label = (text.slice(0, m.index) + ' ' + text.slice(m.index + m[0].length)).replace(/\s+/g, ' ').trim(); }
-      $.keyCap.textContent = key;
-      $.keyCap.classList.toggle('wide', key.length > 2);
-      $.promptText.textContent = label;
+      const hm = key ? /^hold\s+/i.exec(label) : null;
+      if (hm) { hold = true; label = label.slice(hm[0].length); }
+      $.keyCap.textContent = key || '';
+      $.keyCap.classList.toggle('wide', !!key && key.length > 2);
+      $.promptLabel.textContent = label;
+      $.prompt.classList.toggle('hint', !key);
+      $.prompt.classList.toggle('hold', hold);
       $.prompt.classList.add('on');
-      this.hudEl?.classList.add('prompting');
+      this.hudEl?.classList.toggle('prompting', !!key);
     }
     const hasProg = progress != null && isFinite(progress);
     const p = hasProg ? clamp01(+progress) : null;

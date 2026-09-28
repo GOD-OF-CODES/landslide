@@ -1,15 +1,29 @@
 // Pre-load quality screen: shown before the renderer or any heavy asset is created, so the chosen preset decides
 // what gets downloaded (ultra/high = original full-quality assets, medium/low = lighter variants).
 // Low is preselected unless the player chose something before. Skipped with ?quality=, ?autostart and ?cam flags.
+//
+// It is built from the same parts as the loading screen that follows it (src/ui/style.css: the .bd backdrop, the
+// centred wordmark and kicker, the .load-foot row), so the hand-over is seamless: on Continue the choices fade out and
+// a "Preparing" bar takes their place in the exact spot where the HUD's loading bar appears; the gate then stays up
+// until the HUD has built its loading screen underneath, and fades away over it.
 import { QUALITY_PRESETS } from '../core/config.js';
 
 const INFO = {
   low: { title: 'Low', blurb: 'Runs on most laptops and integrated graphics. Lighter textures, fewer effects.' },
   medium: { title: 'Medium', blurb: 'For recent laptops. Sharper textures, soft shadows and ambient occlusion.' },
   high: { title: 'High', blurb: 'Full-quality assets and effects. For Apple Silicon or a dedicated GPU.' },
-  ultra: { title: 'Ultra', blurb: 'Everything at maximum, native Retina resolution. For powerful GPUs.' },
+  ultra: { title: 'Ultra', blurb: 'Everything at maximum, at native Retina resolution. For powerful GPUs.' },
 };
 const ORDER = ['low', 'medium', 'high', 'ultra'];
+/** Download per preset in MB, measured on the production build: the asset files each preset requests at boot, each
+ *  file counted once (QA: brown_mud_rocks_01 and car.glb are requested twice, the second time a 304 from the cache,
+ *  which the earlier count included: High read 95). Code (JS, wasm, CSS) adds about 2.3 MB more on the wire.
+ *  Shared with the loading screen, which counts the same bytes. config.js `download` is only a fallback. */
+export const DOWNLOAD_MB = { low: 24, medium: 37, high: 88, ultra: 88 };
+export const QUALITY_INFO = INFO;
+const BACKDROP = `<div class="bd"><div class="bd-topo"></div>
+  <div class="bd-ridge far"></div><div class="bd-fog f1"></div><div class="bd-ridge near"></div><div class="bd-fog f2"></div>
+  <div class="bd-rain r1"></div><div class="bd-rain r2"></div><div class="bd-grain"></div></div>`;
 
 /** Rough device hint from the WebGL renderer string. It's only a suggestion; the player decides. */
 export function recommendQuality() {
@@ -31,72 +45,101 @@ export function recommendQuality() {
 export function showQualityGate(initial = 'low') {
   const rec = recommendQuality();
   let sel = ORDER.includes(initial) ? initial : 'low';
+  const mb = (k) => DOWNLOAD_MB[k] ?? QUALITY_PRESETS[k]?.download ?? '?';
   const root = document.createElement('div');
   root.id = 'quality-gate';
-  root.innerHTML = `
-  <style>
-    #quality-gate{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;
-      background:radial-gradient(120% 90% at 50% 20%,#1d2226 0%,#0b0d0e 70%);font-family:var(--f-body,system-ui,sans-serif);color:#eceee9}
-    #quality-gate .qg{width:min(920px,calc(100vw - 32px));}
-    #quality-gate h1{font:500 clamp(34px,5vw,64px)/1 var(--f-disp,'Arial Narrow',sans-serif);letter-spacing:.42em;text-indent:.42em;text-align:center;margin:0 0 6px;text-transform:uppercase}
-    #quality-gate .sub{text-align:center;color:rgba(236,238,233,.6);letter-spacing:.18em;text-transform:uppercase;font-size:12px;margin-bottom:34px}
-    #quality-gate .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-    @media (max-width:760px){#quality-gate .grid{grid-template-columns:repeat(2,1fr)}}
-    #quality-gate button.opt{all:unset;box-sizing:border-box;cursor:pointer;padding:18px 16px 16px;border:1px solid rgba(236,238,233,.14);
-      background:rgba(255,255,255,.03);border-radius:6px;min-height:168px;display:flex;flex-direction:column;gap:8px;transition:border-color .2s,background .2s}
-    #quality-gate button.opt:hover{border-color:rgba(236,238,233,.35)}
-    #quality-gate button.opt.on{border-color:#eaa53f;background:rgba(234,165,63,.08);box-shadow:inset 0 0 0 1px #eaa53f}
-    #quality-gate button.opt:focus-visible{outline:2px solid #eaa53f;outline-offset:2px}
-    #quality-gate .t{font:500 22px/1 var(--f-disp,'Arial Narrow',sans-serif);letter-spacing:.14em;text-transform:uppercase}
-    #quality-gate .b{font-size:13px;line-height:1.45;color:rgba(236,238,233,.72);flex:1}
-    #quality-gate .m{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:rgba(236,238,233,.5)}
-    #quality-gate .tag{align-self:flex-start;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#0b0d0e;background:#eaa53f;padding:3px 6px;border-radius:3px}
-    #quality-gate .row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:26px;flex-wrap:wrap}
-    #quality-gate .note{font-size:12px;color:rgba(236,238,233,.55);max-width:560px;line-height:1.5}
-    #quality-gate .go{all:unset;cursor:pointer;padding:14px 30px;background:#eaa53f;color:#0b0d0e;font:600 15px/1 var(--f-disp,'Arial Narrow',sans-serif);letter-spacing:.24em;text-transform:uppercase;border-radius:4px}
-    #quality-gate .go:hover{filter:brightness(1.08)}
-    #quality-gate .go:focus-visible{outline:2px solid #fff;outline-offset:3px}
-  </style>
-  <div class="qg" role="dialog" aria-label="Choose graphics quality">
-    <h1>Landslide</h1>
-    <div class="sub">Choose graphics quality</div>
-    <div class="grid" role="radiogroup">
-      ${ORDER.map((k) => `
-        <button class="opt" role="radio" data-q="${k}" aria-checked="false">
-          <span class="t">${INFO[k].title}</span>
-          ${k === rec ? '<span class="tag">Suggested for this device</span>' : ''}
-          <span class="b">${INFO[k].blurb}</span>
-          <span class="m">≈ ${QUALITY_PRESETS[k].download} MB download</span>
-        </button>`).join('')}
+  root.innerHTML = `${BACKDROP}
+  <div class="load-center qg-center" aria-hidden="true">
+    <div class="brand-mark">LANDSLIDE</div>
+    <div class="load-kicker">A mountain road. Rain. No way back.</div>
+  </div>
+  <div class="qg-foot" role="dialog" aria-label="Choose graphics quality">
+    <div class="load-row"><span class="load-label" id="qg-label">Graphics quality</span><span class="qg-sugg">Suggested for this device: <b>${INFO[rec].title}</b></span></div>
+    <div class="qg-seg" role="radiogroup" aria-labelledby="qg-label">
+      ${ORDER.map((k) => `<button type="button" role="radio" data-q="${k}" aria-checked="false" tabindex="-1">
+        ${k === rec ? '<span class="qg-rec">Suggested</span>' : ''}<span class="qg-name">${INFO[k].title}</span><span class="qg-mb">${mb(k)} MB</span></button>`).join('')}
     </div>
-    <div class="row">
-      <div class="note">You can change this later from the title screen. If the game stutters, pick a lower setting; Low and Medium also adjust resolution automatically to keep it smooth.</div>
-      <button class="go" type="button">Start</button>
+    <p class="qg-blurb" aria-live="polite"></p>
+    <div class="qg-actions">
+      <button type="button" class="m-item primary qg-go"><span class="m-bar"></span><span class="m-label">Continue</span></button>
+      <span class="qg-note">You can change this later in Settings. Low and Medium also lower the resolution by themselves if the game stutters.</span>
     </div>
+  </div>
+  <div class="load-foot qg-prep" aria-hidden="true">
+    <div class="load-row"><span class="load-label">Preparing</span><span class="load-pct">0%</span></div>
+    <div class="load-bar busy"><i></i><b></b></div>
+    <div class="load-meta"><span class="load-q"></span><span class="load-eta"></span></div>
+    <div class="load-tip" style="visibility:hidden">&nbsp;</div>
   </div>`;
   document.body.appendChild(root);
-  const opts = [...root.querySelectorAll('button.opt')];
-  const paint = () => opts.forEach((b) => { const on = b.dataset.q === sel; b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); });
-  paint();
-  opts.find((b) => b.dataset.q === sel)?.focus();
+
+  // reveal the type once the web font is in (or after a short timeout offline), as the HUD does
+  const ready = () => root.classList.add('ready');
+  try {
+    const fl = document.fonts?.load?.('500 40px "Barlow Condensed"');
+    if (fl) Promise.race([fl, new Promise((r) => setTimeout(r, 1200))]).then(ready, ready); else ready();
+  } catch { ready(); }
+
+  const opts = [...root.querySelectorAll('.qg-seg button')];
+  const blurb = root.querySelector('.qg-blurb');
+  const paint = (focus) => {
+    opts.forEach((b) => {
+      const on = b.dataset.q === sel;
+      b.setAttribute('aria-checked', String(on));
+      b.tabIndex = on ? 0 : -1;
+      if (on && focus) b.focus({ preventScroll: true });
+    });
+    blurb.textContent = INFO[sel].blurb;
+  };
+  paint(false);
+  setTimeout(() => { if (!root.classList.contains('leaving')) opts.find((b) => b.dataset.q === sel)?.focus({ preventScroll: true }); }, 60);
+
   return new Promise((resolve) => {
+    let finished = false;
     const done = () => {
-      window.removeEventListener('keydown', onKey);
-      root.style.transition = 'opacity .35s'; root.style.opacity = '0';
-      setTimeout(() => root.remove(), 380);
+      if (finished) return;
+      finished = true;
+      window.removeEventListener('keydown', onKey, true);
+      root.classList.add('leaving');
+      root.querySelector('.qg-prep .load-q').textContent = `${INFO[sel].title} quality · ${mb(sel)} MB`;
+      document.activeElement?.blur?.();
+      handOver(root);
       resolve(sel);
     };
     const onKey = (e) => {
       const i = ORDER.indexOf(sel);
-      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { sel = ORDER[Math.min(3, i + 1)]; paint(); e.preventDefault(); }
-      else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { sel = ORDER[Math.max(0, i - 1)]; paint(); e.preventDefault(); }
-      else if (e.key === 'Enter') { e.preventDefault(); done(); }
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { sel = ORDER[Math.min(3, i + 1)]; paint(true); e.preventDefault(); }
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { sel = ORDER[Math.max(0, i - 1)]; paint(true); e.preventDefault(); }
+      else if (e.key === 'Home') { sel = ORDER[0]; paint(true); e.preventDefault(); }
+      else if (e.key === 'End') { sel = ORDER[3]; paint(true); e.preventDefault(); }
+      else if (e.key === 'Enter' || e.key === 'NumpadEnter') { e.preventDefault(); done(); }
+      else if (e.key === ' ' && document.activeElement?.classList?.contains('qg-go')) { e.preventDefault(); done(); }
     };
-    window.addEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
     opts.forEach((b) => {
-      b.addEventListener('click', () => { sel = b.dataset.q; paint(); });
+      b.addEventListener('click', () => { sel = b.dataset.q; paint(true); });
       b.addEventListener('dblclick', () => { sel = b.dataset.q; done(); });
     });
-    root.querySelector('.go').addEventListener('click', done);
+    root.querySelector('.qg-go').addEventListener('click', done);
   });
+}
+
+/** Keep the gate (now a "Preparing" screen) up until the HUD's own loading screen exists under it, then fade it out. */
+function handOver(root) {
+  const ui = document.getElementById('ui');
+  let gone = false;
+  const leave = () => {
+    if (gone) return;
+    gone = true;
+    mo?.disconnect();
+    clearTimeout(fallback);
+    root.classList.add('gone');
+    setTimeout(() => root.remove(), 700);
+  };
+  const check = () => { if (ui?.querySelector('.screen.loading')) setTimeout(leave, 60); };
+  let mo = null;
+  try { mo = new MutationObserver(check); if (ui) mo.observe(ui, { childList: true }); } catch { mo = null; }
+  const fallback = setTimeout(leave, 45000);
+  check();
+  if (!ui) setTimeout(leave, 400);
 }

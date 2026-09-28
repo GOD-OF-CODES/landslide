@@ -37,6 +37,37 @@ function envUniform(ctx) {
 /** Let the env register the shared uniform so patches made without ctx still animate. */
 export function setEnvUniform(u) { _envUniform = u; }
 
+/**
+ * (LOWEND) Which floating-point colour buffers this GPU can render to: {half, full}. WebGL2 only renders to
+ * RGBA16F / RGBA32F with EXT_color_buffer_float (or EXT_color_buffer_half_float); some old / mobile / software
+ * drivers lack them. Probed once per renderer with a 4x4 target and checkFramebufferStatus (an extension can be
+ * advertised and still give an incomplete framebuffer). ?nofloat=half|full simulates a missing extension (testing).
+ */
+export function floatRTSupport(renderer) {
+  const ud = renderer.userData || (renderer.userData = {});
+  if (ud.floatRT) return ud.floatRT;
+  const sim = new URLSearchParams(location.search).get('nofloat');
+  const probe = (type) => {
+    const rt = new THREE.WebGLRenderTarget(4, 4, { type, depthBuffer: false, stencilBuffer: false });
+    rt.texture.generateMipmaps = false;
+    const prev = renderer.getRenderTarget();
+    let ok = false;
+    try {
+      renderer.setRenderTarget(rt);
+      const gl = renderer.getContext();
+      ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    } catch { ok = false; }
+    renderer.setRenderTarget(prev);
+    rt.dispose();
+    return ok;
+  };
+  const full = sim ? false : probe(THREE.FloatType);
+  const half = sim === 'half' ? false : (full || probe(THREE.HalfFloatType));
+  ud.floatRT = { half, full };
+  if (!half || !full) console.warn('[render] float render targets:', JSON.stringify(ud.floatRT), '- using fallbacks');
+  return ud.floatRT;
+}
+
 function chain(material, key, fn) {
   const prev = material.onBeforeCompile;
   const prevKey = material.customProgramCacheKey;

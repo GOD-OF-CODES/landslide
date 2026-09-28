@@ -8,6 +8,7 @@
 //   carMode: the preferred seated view ('car-cockpit' | 'car-chase'); C toggles it while ctx.control === 'car'
 //   lookBack 0..1: hold Q while driving to look back (cockpit: over the shoulder; chase: camera swings round)
 //   viewmodel: setHeld('hatchet' | null), windup(0..1), strike() -> Promise (the hand-held hatchet on foot)
+//   focusOn(dist, {range, hold, attack, release})   brief, subtle focus pull through post.setDOF (Ultra/High only)
 //
 // Foot: FPS from player.eye/yaw/pitch, stride-synced head-bob, landing dip spring, breathing sway, strafe roll.
 // Chase: spring-damped follow with look-ahead, mouse orbit that recenters, collision against static geometry
@@ -61,6 +62,8 @@ export default class CameraRig {
     this._cin = null; this._cinPos = new THREE.Vector3(); this._cinTarget = new THREE.Vector3();
     this._prevMode = 'foot';
     this._t = 0;
+    // focus pull (post DOF): see focusOn()
+    this._focus = { dist: 10, cur: 10, range: 10, until: -1, amt: 0, on: false, attack: 0.35, release: 0.7 };
     // viewmodel
     this.viewmodel = new Viewmodel(ctx);
 
@@ -99,6 +102,49 @@ export default class CameraRig {
 
   shake(t) { if (t > 0 && isFinite(t)) this.trauma = Math.min(1, this.trauma + t); }
 
+  /**
+   * Brief, subtle focus pull, like a phone camera refocusing on something close (post DOF; only on presets with
+   * config.quality.dof, a no-op elsewhere). Call it every frame while it applies (it lapses `hold` s after the last
+   * call) or once with a longer `hold`. The focus racks to `dist` metres; the background blur eases in over `attack` s
+   * and out over `release` s, then the DOF pass is switched off again (it costs nothing while off).
+   * `range` = metres beyond the focus plane over which the blur ramps to full: bigger is subtler.
+   */
+  focusOn(dist, opts = {}) {
+    if (!(dist > 0) || !isFinite(dist)) return;
+    const F = this._focus;
+    F.dist = dist;
+    F.range = opts.range ?? Math.max(4, dist * 6);
+    F.until = this._t + (opts.hold ?? 0.15);
+    F.attack = opts.attack ?? 0.35; F.release = opts.release ?? 0.7;
+    F.force = !!opts.force;
+  }
+  focusOff() { this._focus.until = -1; }
+
+  _updateFocus(dt) {
+    const F = this._focus, post = this.ctx.post;
+    const q = this.ctx.config?.quality;
+    const can = !!q?.dof && typeof post?.setDOF === 'function';
+    // frame-time budget: the DOF pass costs ~3 ms at 720p on the M1, so on High a gameplay focus pull only starts when
+    // the game is running with headroom (smoothed real frame time under 1/52 s); Ultra and cinematics (force) always
+    const now = performance.now(), fdt = (now - (this._pfPrev || now)) / 1000;
+    this._pfPrev = now;
+    if (fdt > 0 && fdt < 0.25) this._frameT = this._frameT ? this._frameT + (fdt - this._frameT) * 0.05 : fdt;
+    const headroom = F.force || F.on || q?.key === 'ultra' || !(this._frameT > 1 / 52);
+    const want = can && headroom && this._t < F.until ? 1 : 0;
+    const rate = 1 / Math.max(0.05, want ? F.attack : F.release);
+    F.amt = want > F.amt ? Math.min(1, F.amt + dt * rate) : Math.max(0, F.amt - dt * rate);
+    if (F.amt <= 0.001) {
+      if (F.on) { F.on = false; try { post?.setDOF?.(null); } catch {} }
+      return;
+    }
+    if (!F.on) F.cur = F.dist; else F.cur = lerp(F.cur, F.dist, dampK(6, dt));
+    F.on = true;
+    // the blur fades in by narrowing the ramp from "nothing within 600 m" to the requested range (log space: even)
+    const k = smooth01(0, 1, F.amt);
+    const range = Math.exp(lerp(Math.log(600), Math.log(Math.max(0.5, F.range)), k));
+    try { post.setDOF(F.cur, range); } catch {}
+  }
+
   cinematic(pathFn, duration = 5, opts = {}) {
     if (this._cin && !this._cin.done) this._endCinematic(false);
     return new Promise((resolve) => {
@@ -127,6 +173,7 @@ export default class CameraRig {
     const cam = this.camera;
     if (!(dt > 0)) return; // paused: freeze the view
     this._t += dt;
+    this._updateFocus(dt);
     const input = ctx.input;
 
     // C toggles the seated view

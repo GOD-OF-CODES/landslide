@@ -35,7 +35,7 @@ import {
   ToneMappingEffect, ToneMappingMode, VignetteEffect, VignetteTechnique, DepthOfFieldEffect, Pass, EffectAttribute,
 } from 'postprocessing';
 import { N8AOPostPass } from 'n8ao';
-import { SSR_UNIFORMS, applyScreenReflections } from './materials.js';
+import { SSR_UNIFORMS, applyScreenReflections, floatRTSupport } from './materials.js';
 import { MIST_DEFAULTS, createMistNoise3D } from './fog.js';
 
 // Photographic grade (display-referred, after AgX). AgX alone is a deliberately flat, desaturated base; a phone or
@@ -668,6 +668,12 @@ export default class Post {
     renderer.toneMappingExposure = this.exposure;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
 
+    // (LOWEND) Robustness: the chain needs a renderable half-float buffer (linear HDR until AgX). Without one (no
+    // EXT_color_buffer_float / _half_float) the scene renders straight to the canvas with three's built-in AgX tone
+    // mapping (no AO / mist / SSR / bloom / lens / grade); render(), flash() etc. keep working.
+    const fl = this.floatRT = floatRTSupport(renderer);
+    if (!fl.half) { this._initDirect(); return; }
+
     const composer = this.composer = new EffectComposer(renderer, { frameBufferType: THREE.HalfFloatType, multisampling: 0 });
     const size = renderer.getSize(new THREE.Vector2());
 
@@ -675,7 +681,8 @@ export default class Post {
     composer.addPass(this.passes.render);
 
     // ---- ambient occlusion ----------------------------------------------------------------------------------
-    if (q.ao && q.ao !== 'off' && !dbg.has('noao')) {
+    // (N8AO's half-resolution mode downsamples depth into an R32F target: it needs full-float colour buffers)
+    if (q.ao && q.ao !== 'off' && !dbg.has('noao') && (fl.full || !(AO_MODES[q.ao] || AO_MODES.medium)[1])) {
       try {
         const ao = new N8AOPostPass(scene, camera, size.x, size.y);
         ao.autoDetectTransparency = false;
@@ -716,7 +723,8 @@ export default class Post {
     }
 
     // ---- exposure meter (reads the linear scene; tone mapping comes later) -----------------------------------------
-    if (!dbg.has('nometer')) {
+    // (needs a 32-bit float target for the readback: without one the exposure follows the road-position prior only)
+    if (!dbg.has('nometer') && fl.full) {
       this.passes.meter = new MeterPass();
       composer.addPass(this.passes.meter);
       this._meterBuf = new Float32Array(METER_W * METER_H * 4);
@@ -792,13 +800,26 @@ export default class Post {
     // compileAsync only warms the screen variants), so the first frames do not hitch on shader compiles.
     if (!this.ctx.flags?.nopost) {
       try {
-        const prev = renderer.getRenderTarget();
         renderer.setRenderTarget(composer.inputBuffer);
         const ready = renderer.compileAsync(scene, camera);   // compile() runs synchronously with this target
-        renderer.setRenderTarget(prev);
+        // (LOWEND, load time) The render target is deliberately left on the composer's input buffer: main.js's boot
+        // warm-up (renderer.compileAsync right after the last system init) then builds the render-target variants it
+        // actually needs, not a second, never-used set of canvas-output (sRGB) variants of every scene program,
+        // which doubled the shader compile work at boot. Its warm-up render (post.render) resets the target.
         await ready;
       } catch (e) { console.warn('[post] warm-up compile failed', e); }
     }
+  }
+
+  /** Fallback without float render targets: direct canvas render with three's AgX (see init). */
+  _initDirect() {
+    const { renderer } = this.ctx;
+    this.direct = true;
+    renderer.toneMapping = THREE.AgXToneMapping;
+    renderer.toneMappingExposure = this.exposure;
+    const sky = this.ctx.env?.sky?.material;
+    if (sky) { sky.toneMapped = true; sky.needsUpdate = true; }
+    console.warn('[post] no float render targets: direct rendering, post effects off');
   }
 
   setSize() {
@@ -911,8 +932,8 @@ export default class Post {
   flash(color = 0xffffff, t = 0.25) {
     const c = new THREE.Color(color);
     const u = this.effects.final?.uniforms.get('flashCol').value;
-    if (!u) return;
-    u.set(c.r, c.g, c.b, 1);
+    if (!u && !this.direct) return;
+    u?.set(c.r, c.g, c.b, 1);
     this._flash.amount = 1; this._flash.decay = 1 / Math.max(0.02, t);
   }
 
@@ -961,7 +982,16 @@ export default class Post {
   render(dt = 0.016) {
     const { renderer } = this.ctx;
     if (!renderer.info.autoReset) renderer.info.reset();
-    if (!this.composer) { renderer.render(this.ctx.scene, this.ctx.camera); return; }
+    if (!this.composer) {
+      if (this.direct) {
+        const f = this._flash;
+        if (f.amount > 0) f.amount = Math.max(0, f.amount - Math.min(0.1, Math.max(0, dt)) * f.decay);
+        renderer.toneMappingExposure = this.exposure * (1 - this._fade) * (1 + 2 * f.amount * f.amount);
+      }
+      renderer.setRenderTarget(null);
+      renderer.render(this.ctx.scene, this.ctx.camera);
+      return;
+    }
     const d = Math.min(0.1, Math.max(0, dt));
     // eye adaptation: blend of a road-position prior (open up inside the tunnel, so the portal blows out like a
     // real camera) and the centre-weighted scene meter (looking back out toward the exit pulls exposure down a bit)

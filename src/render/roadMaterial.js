@@ -5,7 +5,7 @@
 // Tunnel: cast-concrete portal (formwork panels, tie holes, runoff, name plate, delineators), rubble wing walls,
 // drainage channel, lining with grime + seepage, daylight falloff with depth, analytic sodium lamps.
 import * as THREE from 'three';
-import { GLSL_NOISE, loadTerrainArrays } from './terrainMaterial.js';
+import { GLSL_NOISE, loadTerrainArrays, liteLevel, noiseTexture, VNOISE_ALU, VNOISE_TEX } from './terrainMaterial.js';
 
 // s1: end cap (the tube runs on round the bend past markers.tunnelEnd and fades to black); lampEnd: last lamps.
 // Must match tools/blender/terrain.py TUN_END / LAMP_END.
@@ -472,6 +472,45 @@ void rd_shade() {
 }
 `;
 
+// (LOWEND) Lite road shaders for Medium (1) and Low (2), derived from ROAD_FRAG_PARS by exact substitution (the
+// Ultra/High source stays byte-identical). Texture-backed value noise (one tap instead of four hashes), 3 (Medium) /
+// 2 (Low) fBm octaves; the anti-tiling second asphalt sample is only fetched inside a narrow seam band between the two
+// patch sets (same patch pattern, sharper seams; explicit gradients, so the branch is safe); one rain-ripple layer.
+const _rdWarned = new Set();
+const _rdLite = {};
+function roadFragLite(level) {
+  if (_rdLite[level]) return _rdLite[level];
+  const L2 = level >= 2;
+  const pairs = [
+    [VNOISE_ALU, VNOISE_TEX],
+    ['for (int i = 0; i < 4; i++) { s += a * th_vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p; a *= 0.5; }\n  return s / 0.9375;',
+      L2 ? 'for (int i = 0; i < 2; i++) { s += a * th_vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p; a *= 0.5; }\n  return s / 0.75;'
+        : 'for (int i = 0; i < 3; i++) { s += a * th_vnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p; a *= 0.5; }\n  return s / 0.875;'],
+  ];
+  pairs.push(
+    [`  float kt = smoothstep(0.3, 0.7, th_vnoise(vec2(d * 0.4, s * 0.07)));
+  vec3 c1 = texture(uAsph, uv1).rgb, c2 = texture(uAsph, uv2).rgb;
+  vec3 n1 = texture(uAsphN, uv1).xyz * 2.0 - 1.0, n2 = texture(uAsphN, uv2).xyz * 2.0 - 1.0;
+  n2.xy = vec2(cr * n2.x + sr * n2.y, -sr * n2.x + cr * n2.y);
+  vec3 a1 = texture(uAsphArm, uv1).rgb, a2 = texture(uAsphArm, uv2).rgb;`,
+    `  float kt = smoothstep(0.43, 0.57, th_vnoise(vec2(d * 0.4, s * 0.07)));
+  vec2 g1x = dFdx(uv1), g1y = dFdy(uv1), g2x = dFdx(uv2), g2y = dFdy(uv2);
+  vec3 c1 = vec3(0.1), c2 = vec3(0.1), n1 = vec3(0.0, 0.0, 1.0), n2 = n1, a1 = vec3(1.0, 0.8, 0.0), a2 = a1;
+  if (kt < 0.999) { c1 = textureGrad(uAsph, uv1, g1x, g1y).rgb; n1 = textureGrad(uAsphN, uv1, g1x, g1y).xyz * 2.0 - 1.0; a1 = textureGrad(uAsphArm, uv1, g1x, g1y).rgb; }
+  if (kt > 0.001) {
+    c2 = textureGrad(uAsph, uv2, g2x, g2y).rgb; n2 = textureGrad(uAsphN, uv2, g2x, g2y).xyz * 2.0 - 1.0; a2 = textureGrad(uAsphArm, uv2, g2x, g2y).rgb;
+    n2.xy = vec2(cr * n2.x + sr * n2.y, -sr * n2.x + cr * n2.y);
+  }`],
+    ['      rp += rd_ripple(vec2(d, s) * 3.1 + 7.0, uTime * 1.13 + 0.5) * 0.16;\n', '      rp *= 1.3;\n'],
+  );
+  let src = ROAD_FRAG_PARS;
+  for (const [a, b] of pairs) {
+    if (!src.includes(a)) { if (!_rdWarned.has(a)) { _rdWarned.add(a); console.warn('[road] lite substitution not found, skipped:', a.slice(0, 60)); } continue; }
+    src = src.split(a).join(b);
+  }
+  return (_rdLite[level] = src);
+}
+
 // (s0, s1, mud strength, w). w = sheet-flow strength: water from the gully / slide running across the road. Also
 // suppresses mud coming in from the valley edge (1 - w).
 const MUD_ZONES = [
@@ -488,8 +527,10 @@ export async function createRoadMaterial(ctx) {
     uAlb: { value: arr.alb }, uNrm: { value: arr.nrm },
     uWet: { value: ctx.env?.wetness ?? 0.75 }, uTime: { value: 0 },
     uMudZones: { value: MUD_ZONES.map((z) => new THREE.Vector4(...z)) },
+    uNoise: { value: noiseTexture() },
     ...tunnelUniforms(ctx),
   };
+  let lite = liteLevel(ctx);
   const rdDbg = +(new URLSearchParams(location.search).get('roadDebug') || 0);
   m.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, uniforms);
@@ -497,7 +538,7 @@ export async function createRoadMaterial(ctx) {
       .replace('#include <common>', '#include <common>\nattribute vec4 masks;\nvarying vec2 vRoad;\nvarying vec4 vMasks;\nvarying vec3 vWPos;')
       .replace('#include <fog_vertex>', '#include <fog_vertex>\n vRoad = uv; vMasks = masks; vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', '#include <common>\n' + ROAD_FRAG_PARS)
+      .replace('#include <common>', '#include <common>\n' + (lite ? roadFragLite(lite) : ROAD_FRAG_PARS))
       .replace('#include <map_fragment>', 'rd_shade(); diffuseColor.rgb = rdAlb;')
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = rdRough;')
       .replace('#include <normal_fragment_maps>', 'normal = normalize( tbn * rdTN );')
@@ -519,8 +560,11 @@ export async function createRoadMaterial(ctx) {
         }
       }`);
   };
-  m.customProgramCacheKey = () => 'road-v3' + rdDbg;
+  m.customProgramCacheKey = () => 'road-v3' + rdDbg + (lite ? '|lite' + lite : '');
   m.userData.uniforms = uniforms;
+  m.userData.lite = lite;
+  /** debug / A-B: switch the shader tier at runtime (recompiles once). */
+  m.userData.setLite = (n) => { if (n !== lite) { lite = n; m.userData.lite = n; m.needsUpdate = true; } };
   m.userData.update = (dt) => {
     uniforms.uWet.value = ctx.env?.wetness ?? uniforms.uWet.value;
     uniforms.uTime.value += dt;

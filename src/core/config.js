@@ -22,8 +22,10 @@ export const QUALITY_PRESETS = {
     treeMeshDistance: 80, impostorDistance: 1800, rain: 0.8, maxRocks: 70, anisotropy: 8,
     assetTier: null, adaptiveRes: false, download: 90,
   },
+  // (LOWEND) medium/low: the sun's map is 1024² (soft overcast shadows: ~9-10 cm texels, PCF radius 3 -> ~0.3 m
+  // penumbra, like a real shadow under thick cloud); shadowMapSize stays the tier flag other systems test.
   medium: {
-    name: 'Medium', pixelRatio: 0.8, maxDpr: 1, shadowMapSize: 2048, shadowRadius: 50,
+    name: 'Medium', pixelRatio: 0.8, maxDpr: 1, shadowMapSize: 2048, sunShadowMapSize: 1024, shadowRadius: 46,
     ao: 'low', bloom: true, motionBlur: false, dof: false, grassDensity: 0.45, grassRadius: 40,
     treeMeshDistance: 55, impostorDistance: 1400, rain: 0.6, maxRocks: 50, anisotropy: 4,
     assetTier: 'mid', adaptiveRes: true, download: 39,

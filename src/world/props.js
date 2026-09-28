@@ -98,7 +98,22 @@ export default class Props {
 
     const step = (name, fn) => { try { fn(); } catch (e) { console.error(`[props] ${name} failed`, e); } };
     step('items', () => this._buildItems());
+    const preSite = new Set(this.root.children);
     step('site', () => this._buildSite());
+    // (LOWEND) Medium/Low: the roadworks dressing (barriers, sandbags, tarp piles, plank stack, crates: ~150k
+    // triangles, ~20 draws) is hidden while the camera is far from the site (it is a few pixels there, and usually
+    // behind the terrain). Interactable items, the dynamic cones and anything holding a light stay untouched.
+    const qk = ctx.config?.quality?.key;
+    if (qk === 'low' || qk === 'medium') {
+      const keep = new Set([...Object.values(this.items || {}), this.coneMesh].filter(Boolean));
+      const hasLight = (o) => { let l = false; o.traverse((c) => { if (c.isLight) l = true; }); return l; };
+      this._siteCull = this.root.children.filter((o) => !preSite.has(o) && !keep.has(o) && !hasLight(o));
+      // the plank stack item (12 boards, ~23k triangles): its meshes, not the item group (hideItem owns that)
+      if (this.items?.planks) this._siteCull.push(...this.items.planks.children);
+      this._siteCullR = qk === 'low' ? 200 : 280;
+      this._siteC = road.worldAt(this.RW, -6, new THREE.Vector3()).clone();
+      this._siteVis = true;
+    }
     step('guardrails', () => this._buildGuardrails());
     step('delineators', () => this._buildDelineators());
     step('signs', () => this._buildSigns());
@@ -749,6 +764,10 @@ float plDirtRough;`)
     // ---- chunked instancing with hi/lo swap
     const CH = 8;
     const hasBent = !!this.protos.guardrail_bent, hasLod = !!this.protos.guardrail_lod, hasRefl = !!this.protos.rail_reflector;
+    // (LOWEND) Medium/Low: the far LOD of every chunk lives in ONE instanced mesh (a near chunk zeroes its instances
+    // there), ~30 fewer draw calls whenever the road is in view. Ultra/High keep one lo mesh per chunk.
+    const qk = this.ctx.config?.quality?.key;
+    const mergedLo = (qk === 'low' || qk === 'medium') ? [] : null;
     for (let i = 0; i < segs.length; i += CH) {
       const part = segs.slice(i, i + CH);
       const grp = new THREE.Group();
@@ -765,13 +784,28 @@ float plDirtRough;`)
         const rm = part.filter((_, k) => (i + k) % 2 === 0).map((sg) => sg.m);
         this.instanced('rail_reflector', rm, { parent: hi, cast: false });
       }
-      if (hasLod) this.instanced('guardrail_lod', part.map((sg) => sg.m), { parent: lo, cast: false });
+      let range = null;
+      if (mergedLo) { range = [mergedLo.length, part.length]; for (const sg of part) mergedLo.push(sg.m); }
+      else if (hasLod) this.instanced('guardrail_lod', part.map((sg) => sg.m), { parent: lo, cast: false });
       else this.instanced('guardrail', part.map((sg) => sg.m), { parent: lo, cast: false });
       const c = new THREE.Vector3();
       for (const sg of part) c.add(_v.setFromMatrixPosition(sg.m));
       c.multiplyScalar(1 / part.length);
       hi.visible = true; lo.visible = false;
-      this.railChunks.push({ grp, hi, lo, center: c, near: true });
+      this.railChunks.push({ grp, hi, lo, center: c, near: true, range });
+    }
+    if (mergedLo?.length) {
+      const ims = this.instanced(hasLod ? 'guardrail_lod' : 'guardrail', mergedLo, { parent: this.root, cast: false });
+      for (const im of ims) {
+        im.name = 'guardrail_lod_merged';
+        im.frustumCulled = false;
+        im.userData.shadowCull = false;
+        im.userData.full = im.instanceMatrix.array.slice();   // per-instance matrices to restore
+        // every chunk starts 'near' (hi visible): hide all far-LOD instances until the first LOD pass
+        im.instanceMatrix.array.fill(0);
+        im.instanceMatrix.needsUpdate = true;
+      }
+      this.railLoMerged = ims;
     }
     // terminals: separate meshes (mirrored ones need a negative-determinant Mesh, which three handles per object)
     if (this.protos.guardrail_end) {
@@ -999,9 +1033,24 @@ float plDirtRough;`)
     }
     // guardrail LOD swap (cheap: ~20 chunks, every 8 frames)
     if (cam && (this._frame++ & 7) === 0) {
+      if (this._siteCull) {
+        const vis = cam.position.distanceTo(this._siteC) < this._siteCullR;
+        if (vis !== this._siteVis) { this._siteVis = vis; for (const o of this._siteCull) o.visible = vis; }
+      }
       for (const c of this.railChunks) {
         const near = c.center.distanceTo(cam.position) < LOD_DIST + 16;
-        if (near !== c.near) { c.near = near; c.hi.visible = near; c.lo.visible = !near; }
+        if (near !== c.near) {
+          c.near = near; c.hi.visible = near;
+          if (c.range && this.railLoMerged) {
+            // merged far LOD: show / zero this chunk's instances
+            const [i0, n] = c.range;
+            for (const im of this.railLoMerged) {
+              const a = im.instanceMatrix.array;
+              if (near) a.fill(0, i0 * 16, (i0 + n) * 16); else a.set(im.userData.full.subarray(i0 * 16, (i0 + n) * 16), i0 * 16);
+              im.instanceMatrix.needsUpdate = true;
+            }
+          } else c.lo.visible = !near;
+        }
       }
     }
     // dynamic cones -> instance matrices (only while awake)

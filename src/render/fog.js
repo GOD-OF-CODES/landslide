@@ -459,11 +459,46 @@ function installSunSoftSpec() {
  * Install the height fog globally. Idempotent. Returns the shared uniform set.
  * Must run before materials compile (env does it in its constructor).
  */
-export function installFog(uniforms = createFogUniforms()) {
+// (LOWEND) Lite fog for the Low preset: 2-octave fBm, one density sample per mist sheet (instead of two), and the
+// cloud-deck patchiness from the ray's end point only. Same model and uniforms; about half the noise taps in every
+// material. Derived by exact substitution, so the full chunk (Ultra/High/Medium) is byte-identical to before.
+const FBM_FULL = `float hfog_fbm(vec2 p) {
+  float s = 0.5 * hfog_vnoise(p);
+  p = mat2(1.6, 1.2, -1.2, 1.6) * p + vec2(3.1, 1.7);
+  s += 0.3 * hfog_vnoise(p);
+  p = mat2(1.6, 1.2, -1.2, 1.6) * p + vec2(3.1, 1.7);
+  s += 0.2 * hfog_vnoise(p);
+  return s;
+}`;
+const FBM_LITE = `float hfog_fbm(vec2 p) {
+  float s = 0.5 * hfog_vnoise(p);
+  p = mat2(1.6, 1.2, -1.2, 1.6) * p + vec2(3.1, 1.7);
+  s += 0.3 * hfog_vnoise(p);
+  return s * 1.25;
+}`;
+const SHEET_FULL = `  vec2 a = hfog_mistDensity(ro + rd * mix(ta, tb, 0.3), yc, hh, cov);
+  vec2 b = hfog_mistDensity(ro + rd * mix(ta, tb, 0.75), yc, hh, cov);
+  float d = a.x + b.x;
+  float br = (a.x * a.y + b.x * b.y) / max(d, 1e-4);`;
+const SHEET_LITE = `  vec2 a = hfog_mistDensity(ro + rd * mix(ta, tb, 0.5), yc, hh, cov);
+  float d = 2.0 * a.x;
+  float br = a.y;`;
+const CLOUD_FULL = `  float n = 0.5 * (hfog_fbm((pe.xz - drift) * hfogCloud2.w) + hfog_fbm((p1.xz - drift) * hfogCloud2.w + vec2(0.0, (p1.y - hfogCloud.x) * hfogCloud2.w)));`;
+const CLOUD_LITE = `  float n = hfog_fbm((p1.xz - drift) * hfogCloud2.w + vec2(0.0, (p1.y - hfogCloud.x) * hfogCloud2.w));`;
+export function liteFogChunk(src) {
+  for (const [a, b] of [[FBM_FULL, FBM_LITE], [SHEET_FULL, SHEET_LITE], [CLOUD_FULL, CLOUD_LITE]]) {
+    if (src.includes(a)) src = src.split(a).join(b);
+    else console.warn('[fog] lite substitution not found, skipped:', a.slice(0, 50));
+  }
+  return src;
+}
+
+/** opts.lite (Low preset): cheaper noise in the per-pixel fog (see liteFogChunk). Must run before any compile. */
+export function installFog(uniforms = createFogUniforms(), opts = {}) {
   if (_installed) return _installed;
   THREE.ShaderChunk.fog_pars_vertex = CHUNK_PARS_VERTEX;
   THREE.ShaderChunk.fog_vertex = CHUNK_VERTEX;
-  THREE.ShaderChunk.fog_pars_fragment = CHUNK_PARS_FRAGMENT;
+  THREE.ShaderChunk.fog_pars_fragment = opts.lite ? liteFogChunk(CHUNK_PARS_FRAGMENT) : CHUNK_PARS_FRAGMENT;
   THREE.ShaderChunk.fog_fragment = CHUNK_FRAGMENT;
   if (!THREE.ShaderChunk.lights_fragment_maps.includes('htunnel_occ')) THREE.ShaderChunk.lights_fragment_maps += CHUNK_TUNNEL;
   installLightSkip();

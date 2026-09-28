@@ -25,7 +25,7 @@ npm install
 npm run dev          # http://localhost:5173
 ```
 
-Open **http://localhost:5173**, pick a quality preset under *Settings* if you like, and press **Start**. Click into the page to capture the mouse. Headphones are recommended.
+Open **http://localhost:5173**, choose a graphics quality on the first screen (*Low* is preselected; see [Quality settings](#quality-settings)), and press **Start**. Click into the page to capture the mouse. Headphones are recommended.
 
 Production build (static files, relative paths, so it can be hosted from any sub-folder):
 
@@ -47,29 +47,53 @@ npm run preview      # serves dist/ at http://localhost:4173
 
 ## Quality settings
 
-On the first visit a quality screen appears before anything heavy is downloaded (*Low* is preselected, with a suggestion for your GPU; *Medium* and *Low* load lighter asset variants). You can change it later on the title screen (*Settings → Graphics quality*; the page reloads), or add `?quality=ultra|high|medium|low` to the URL. The choice is remembered in `localStorage`.
+**Quality screen.** When the game opens, a quality screen comes up before the renderer is created or any heavy file is downloaded, because the preset decides what gets downloaded. On a first visit *Low* is preselected, so any machine can start; the screen also suggests a preset for your GPU (read from the WebGL renderer string) and shows each preset's download size. Arrow keys and Enter work as well as the mouse. After **Continue** the screen fades into the loading screen. The choice is remembered in `localStorage` and preselected on the next visit; you can change it later on the title screen (*Settings → Graphics quality*, which reloads the page) or with `?quality=ultra|high|medium|low` in the URL. The screen is skipped for `?quality=`, `?autostart` and the fixed-camera debug flags, and after a choice made earlier in the same tab.
 
-| Preset | Render resolution | Sun shadow | AO | Wet-road reflections | Extras | Vegetation |
-|---|---|---|---|---|---|---|
-| **Ultra** | native, up to 2× DPR (Retina) | 4096², 70 m, lamp spot shadow | N8AO medium, full-res | screen-space, 20-step march (road + puddles) | camera motion blur at speed | grass 70 m, mesh trees 110 m |
-| **High** | 1× CSS pixels | 2048², 60 m | N8AO low, half-res | screen-space, 10-step march (road) | camera motion blur at speed | grass 55 m, mesh trees 80 m |
-| **Medium** | 0.8× | 2048², 50 m | N8AO performance | screen "infinity" sample only | | grass 40 m, mesh trees 55 m |
-| **Low** | 0.65× | 1024², 40 m | off | env map only | no bloom | grass 28 m, mesh trees 35 m |
+*Ultra* and *High* load the original full-quality assets. *Medium* and *Low* load lighter variants built by `node tools/make_variants.mjs` (`public/assets/q/`: WebP textures at 1024 px on Medium and 512 px on Low, except the asphalt and the cut-face rock, which keep 1024 px on Low, plus a 1k HDRI), and they lower the render resolution by themselves, in 10 % steps down to 55 %, if the frame rate stays under about 40 fps.
+
+| Preset | Download | Render resolution | Sun shadow | AO | Wet-road reflections | Extras | Vegetation |
+|---|---|---|---|---|---|---|---|
+| **Ultra** | 88 MB | native, up to 2× DPR (Retina) | 4096², 70 m, lamp spot shadow | N8AO medium, full-res | screen-space, 20-step march (road + puddles) | camera motion blur at speed | grass 70 m, mesh trees 110 m |
+| **High** | 88 MB | 1× CSS pixels | 2048², 60 m | N8AO low, half-res | screen-space, 10-step march (road) | camera motion blur at speed | grass 55 m, mesh trees 80 m |
+| **Medium** | 37 MB | 0.8×, adaptive | 1024², 46 m | N8AO performance | screen "infinity" sample only | 1024 px textures; lighter terrain and road shaders | grass 40 m, mesh trees 55 m |
+| **Low** | 24 MB | 0.65×, adaptive | 1024², 40 m | off | env map only | 512 px textures; no bloom, no volumetric mist; lighter terrain, road, fog and sky shaders | grass 28 m, mesh trees 35 m |
+
+The download column counts the asset files (each file once). The code (JavaScript, WebAssembly, CSS) adds about 2.3 MB compressed. Loading the production build (`vite build` + `vite preview`, headless Chrome on the M1, network throttled to 25 Mbit/s, fresh cache, measured until the first frame of the game):
+
+| Preset | Transferred | Time to the first frame at 25 Mbit/s |
+|---|---|---|
+| Low | 26.2 MB | 11.5 s |
+| Medium | 39.0 MB | 16.7 s |
+| High | 90.0 MB | 34.0 s |
 
 The post chain is N8AO, a volumetric mist pass, a half-resolution history copy for the wet-road reflections, then bloom, a lens model (slight barrel distortion, lateral chromatic aberration, veiling glare, off-axis softness), AgX tone mapping and a colour grade, then SMAA, vignette and film grain. Eye adaptation is driven by a centre-weighted exposure meter that behaves like a phone camera (the tunnel mouth stays a dark hole until you are inside). The presets live in `src/core/config.js`. Under the overcast sky shadows are soft anyway, so High renders the sun's shadow map at 2048² (`sunShadowMapSize`), which saves about 1 ms a frame on the M1 compared with 4096².
 
-**Performance target:** at least 45 fps at 1280×720 on *High* on an Apple M1 (7-core GPU, 8 GB), within about 1.5 M triangles and 400 draw calls. The final QA pass measured this on a fanless MacBook Air M1:
+**Performance target:** at least 45 fps at 1280×720 on *High* on an Apple M1 (7-core GPU, 8 GB), within about 1.5 M triangles and 400 draw calls. The QA pass after the low-end work measured on a fanless MacBook Air M1 (headless Chrome, 1280×720, vsync-capped at 60 fps; the machine had been under GPU load for about three hours, so these are warm numbers). The low-end work did not change *Ultra* or *High*. Their terrain, road, tree, fog and sky shaders are byte-identical to the build before it; only the rockfall dust, tyre spray and rock-chip particle shaders differ, because a separate polish pass retuned them. Screenshots of the static scene at fixed viewpoints differ only by run-to-run noise (rain, film grain, wind), and the uncapped frame times below match the earlier measurements (19.4, 17.4, 19.3, 18.4 and 13.5 ms) within 0.2 ms.
 
-| Measurement (High, 1280×720) | Result |
-|---|---|
-| Full automated playthrough on *High* (`--quality=high`), average fps per 50 m section, three full runs on the final build (all won, no deaths, no console errors) | 53–61 fps in the intro, on foot and in the escape. The slowest section is the washout (laying the planks on foot, looking down into the trench, where the terrain shader fills most of the screen): 52 fps after a 10-minute cool-down, 48–49 fps on a machine that had been under GPU load for over an hour |
-| Lowest one-second sample in those runs | 45–46 fps (the washout) |
-| Per-section peaks in those runs | 0.5–2.1 M triangles, 141–381 draw calls |
-| Uncapped frame time at fixed viewpoints (s = 150, 305, 560, 700, 1140; frames rendered back to back with one sync at the end, so it includes about 2 ms of CPU submission that gameplay overlaps with the GPU) | 19.4, 17.4, 19.3, 18.4 and 13.5 ms |
-| Earlier QA pass: two viewpoints (s = 150, 560) after ~90 min of continuous load (thermal throttling) | 50–52 fps |
-| Earlier QA pass: full-screen 1440×900 window (1× DPR), four viewpoints, throttled | 38–41 fps |
+Full automated playthroughs (`node scratch/game/playthrough.mjs --perf --quality=<preset>`), two runs per preset, average fps per section (lowest one-second sample in brackets). All four runs won with no console errors. Three had no deaths; one Low run lost the car once over the unguarded edge at the fallen tree (s = 302) and won from the checkpoint. A third Low run (not in the table) also won, after one rollover just inside the tunnel mouth (s = 1162).
 
-The MacBook Air has no fan, so after 30–60 minutes of full GPU load it throttles and every number above drops by about 10 %. Frame rates also drop sharply if another app is using the GPU at the same time: in one session another app kept the GPU about 55 % busy, and the same build measured 36–49 fps. Choose *Ultra* on a faster GPU for Retina-native resolution, or *Medium* on a warm or busy laptop.
+| Section | High, run 1 | High, run 2 | High peak tris / calls | Low, run 1 | Low, run 2 | Low peak tris / calls |
+|---|---|---|---|---|---|---|
+| Intro drive, cockpit (s 40–175) | 60 (58) | 60 (60) | 1.9 M / 355 | 60 (60) | 60 (60) | 1.0 M / 226 |
+| Rockfall cinematic (s 150–200) | 51 (46) | 52 (46) | 2.1 M / 363 | 58 (52) | 58 (52) | 1.0 M / 225 |
+| Coasting to the stall (s 180–250) | 57 (50) | 58 (46) | 2.1 M / 371 | 60 (60) | 60 (60) | 1.1 M / 237 |
+| On foot: stall, fallen tree, roadworks | 57 (47) | 54 (47) | 1.8 M / 358 | 60 (58) | 60 (60) | 1.0 M / 223 |
+| Escape drive to the washout (s 250–545) | 60 (57) | 60 (59) | 2.0 M / 371 | 60 (60) | 60 (60) | 1.1 M / 274 |
+| Washout: laying the planks on foot (s 550) | 50 (46) | 48 (45) | 1.4 M / 346 | 60 (60) | 60 (60) | 0.7 M / 184 |
+| Escape drive past the gullies (s 550–1100) | 59 (48) | 59 (54) | 1.8 M / 388 | 60 (60) | 60 (60) | 1.0 M / 266 |
+| Tunnel approach and win (s 1100–1180) | 60 (60) | 60 (60) | 1.0 M / 245 | 60 (60) | 60 (60) | 0.6 M / 148 |
+
+Low sits at the 60 fps cap almost everywhere, so its headroom shows better in the uncapped frame time. `node scratch/qa/bench.mjs "<s>,-1.5,1.6,30" --quality=<preset> --tests=none` renders frames back to back at a fixed viewpoint with one sync at the end, so it includes about 2 ms of CPU submission that gameplay overlaps with the GPU. The fixed camera turns adaptive resolution off, so Medium and Low render at their nominal 0.8× and 0.65×.
+
+| Uncapped frame time, 1280×720 | s = 150 (slide scar) | s = 305 (fallen tree) | s = 560 (washout) | s = 700 (gullies) | s = 1140 (tunnel portal) |
+|---|---|---|---|---|---|
+| High | 19.2 ms | 17.5 ms | 19.4 ms | 18.2 ms | 13.4 ms |
+| Medium | 10.4 ms | 9.5 ms | 9.9 ms | 9.6 ms | 8.0 ms |
+| Low | 5.1 ms | 4.9 ms | 4.9 ms | 4.7 ms | 4.2 ms |
+
+Earlier QA passes on *High*: 50–52 fps at two viewpoints (s = 150, 560) after about 90 minutes of continuous load, and 38–41 fps in a full-screen 1440×900 window (1× DPR) while throttled. On a software rasteriser (Chrome with SwiftShader, no GPU) the Low preset still loads and runs with no errors, at a few frames per second.
+
+The MacBook Air has no fan, so after 30–60 minutes of full GPU load it throttles and every number above drops by about 10 %. Frame rates also drop sharply if another app is using the GPU at the same time: in one session another app kept the GPU about 55 % busy, and the same build measured 36–49 fps on *High*. Choose *Ultra* on a faster GPU for Retina-native resolution, or *Medium* or *Low* on a warm, busy or older laptop.
 
 ## How it was made
 

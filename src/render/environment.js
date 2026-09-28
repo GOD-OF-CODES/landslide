@@ -20,7 +20,8 @@
 //   Tunnel: all built-in lit materials lose sky light (IBL + hemi) inside the road tunnel (markers.tunnel..tunnelEnd),
 //           so only the tunnel's own lamps light it. Opt out per material with defines.HTUNNEL_OFF.
 import * as THREE from 'three';
-import { installFog, createFogUniforms, writeFogUniforms, FOG_DEFAULTS, FOG_GLSL_UNIFORMS, FOG_GLSL_FUNCS, MIST_DEFAULTS, rainExtinction } from './fog.js';
+import { floatRTSupport } from './materials.js';
+import { liteFogChunk, installFog, createFogUniforms, writeFogUniforms, FOG_DEFAULTS, FOG_GLSL_UNIFORMS, FOG_GLSL_FUNCS, MIST_DEFAULTS, rainExtinction } from './fog.js';
 import * as materials from './materials.js';
 
 const DEG = Math.PI / 180;
@@ -164,6 +165,20 @@ void main() {
   gl_FragColor = vec4(L, 1.0);
 }`;
 
+// (LOWEND) Low preset sky: the same HDRI, haze and cloud structure with fewer noise taps (the deck structure's fine
+// octave and the scud's detail layer are single value-noise taps; the fog functions use the lite fog chunk).
+function skyFragLite() {
+  let f = liteFogChunk(SKY_FRAG);
+  for (const [a, b] of [
+    ['float n = 0.65 * hfog_fbm(pp * 0.9 + w) + 0.35 * hfog_fbm(pp * 3.3 - w * 1.8 + 7.0);',
+      'float n = 0.65 * hfog_fbm(pp * 0.9 + w) + 0.35 * hfog_vnoise(pp * 3.3 - w * 1.8 + 7.0);'],
+    ['float s2 = hfog_fbm(ps * 3.6 + ws * 1.6 - 5.0);', 'float s2 = hfog_vnoise(ps * 3.6 + ws * 1.6 - 5.0);'],
+    ['float sc = smoothstep(0.47, 0.62, s1 * 0.7 + s2 * 0.3 + 0.1 * (hfog_vnoise(ps * 11.0 + ws * 2.0) - 0.5));',
+      'float sc = smoothstep(0.47, 0.62, s1 * 0.7 + s2 * 0.3);'],
+  ]) { if (f.includes(a)) f = f.split(a).join(b); else console.warn('[env] lite sky substitution not found:', a.slice(0, 50)); }
+  return f;
+}
+
 const _v = new THREE.Vector3(), _f = new THREE.Vector3(), _c = new THREE.Vector3(), _x = new THREE.Vector3(), _y = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
 const _sph = new THREE.Sphere();
@@ -180,6 +195,10 @@ export default class Environment {
     this.autoLightning = ctx.flags?.fixedCam ? 0 : 70;
     this._nextStrike = 0;
     this.look = { ...LOOK };
+    // (LOWEND) shorter shadow-caster distances on the lighter presets (the shadow map also covers less: config)
+    const qk0 = ctx.config?.quality?.key;
+    if (qk0 === 'low') Object.assign(this.look, { shadowCullBase: 16, shadowCullK: 10, shadowCullTerrain: 28 });
+    else if (qk0 === 'medium') Object.assign(this.look, { shadowCullBase: 24, shadowCullK: 14, shadowCullTerrain: 38 });
     this.fog = JSON.parse(JSON.stringify(FOG_DEFAULTS));
     this.fog.rainExtinction = rainExtinction(this._rain);   // grey veil of the falling rain (follows env.rain)
     this.mist = JSON.parse(JSON.stringify(MIST_DEFAULTS));   // volumetric mist settings (rendered by post MistPass)
@@ -188,7 +207,7 @@ export default class Environment {
     const qk = ctx.config?.quality?.key;
     if (qk === 'low' || ctx.flags?.nopost || /(^|[?&,=])nomist/.test(location.search)) this.fog.mistDensity = 0.008;
     // Fog chunks must be installed before any material compiles: do it right away.
-    this.fogUniforms = installFog(createFogUniforms());
+    this.fogUniforms = installFog(createFogUniforms(), { lite: qk === 'low' });
     this.uniforms = this.fogUniforms; // alias
     this.materials = materials;
     materials.setEnvUniform(this.fogUniforms.hEnv);
@@ -271,7 +290,7 @@ export default class Environment {
       ...this._sharedFogUniforms(),
     };
     const skyMat = new THREE.ShaderMaterial({
-      name: 'SkyDome', uniforms: this.skyUniforms, vertexShader: SKY_VERT, fragmentShader: SKY_FRAG,
+      name: 'SkyDome', uniforms: this.skyUniforms, vertexShader: SKY_VERT, fragmentShader: q.key === 'low' ? skyFragLite() : SKY_FRAG,
       side: THREE.BackSide, depthWrite: false, depthTest: true, depthFunc: THREE.LessEqualDepth, fog: false, toneMapped: false,
     });
     if (!skyTex) skyMat.defines = { SKY_HDR: '' };
@@ -288,6 +307,9 @@ export default class Environment {
     await this._buildEnvMap(q);
 
     // ---- lights ------------------------------------------------------------------------------------------------
+    // no IBL (see _buildEnvMap): the hemisphere light carries the overcast sky's irradiance instead (pi x the mean
+    // sky radiance x envIntensity, matched by eye against the IBL render)
+    if (this._noIBL) this.look.hemiIntensity = L.hemiIntensity + Math.PI * 0.62 * L.envIntensity;
     this.hemi = new THREE.HemisphereLight(new THREE.Color().setRGB(...L.hemiSky), new THREE.Color().setRGB(...L.hemiGround), L.hemiIntensity);
     this.hemi.name = 'env_hemi';
     scene.add(this.hemi);
@@ -357,6 +379,9 @@ export default class Environment {
   async _buildEnvMap(q) {
     const { renderer, scene, assets } = this.ctx;
     const L = this.look;
+    // (LOWEND) PMREM renders into half-float targets: without them (no EXT_color_buffer_float/_half_float) there is
+    // no IBL; the hemisphere light takes over the sky's diffuse share (see init) and specular falls back to the sun.
+    if (!floatRTSupport(renderer).half) { this._noIBL = true; return; }
     let hdr = null;
     try { hdr = await assets.hdr('assets/sky/env_2k.hdr'); } catch (e) { console.warn('[env] env_2k.hdr failed', e); }
     const pmrem = new THREE.PMREMGenerator(renderer);

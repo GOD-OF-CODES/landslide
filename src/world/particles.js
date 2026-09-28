@@ -2,12 +2,26 @@
 // splashes, drips, wheel droplets, ground mist and the windshield (refracting drops + wipers in the cockpit view).
 //
 // API (DESIGN.md "particles"):
-//   dust(pos, size = 1, energy = 0.5)   billowing, sky-lit dust burst (soft particles against the scene depth)
+//   dust(pos, size = 1, energy = 0.5)   billowing slide dust: brownish grey, lit from above, dark dense base (soft particles)
+//   impact(pos, {energy, radius, surface, first, ground})   what a rock hitting the ground throws, by surface:
+//                                       soil / mud: dark brown mud spray + clots and a low, short-lived grey-brown mist;
+//                                       asphalt / rock: grey chips, water spray + splash crowns, a thin grey mist
 //   debris(pos, count = 8, opts)        rock chips + mud splatter thrown ballistically (land and settle, then fade)
 //   splash(pos)                         a single rain/water splash
 //   drop(pos, vel, diameterMm)          one ballistic water drop (motion-blurred streak + splash where it lands)
 //   rain / veils / drips / windshield: automatic (intensity from ctx.env.rain; windshield when cameraRig.mode === 'car-cockpit')
-//   It listens to 'impact' events and spawns dust + debris automatically.
+//   It listens to 'impact' events and spawns the impact effects automatically ('surface' / 'ground' in the payload are
+//   used when present, else terrain.surfaceAt() decides; source 'front' = grinding at the debris front's snout).
+//   Exports PAL (bulk albedos of mud, mist, spray, slide dust) and palMix() for landslide.js's set-piece clouds.
+//   Medium / Low: FX_Q scales every effect's sprite / chip count and the dust + chip pools are smaller.
+//
+// DUST PHOTOMETRY (scratch/dust/calib.js): the lit-dust shading (uAmbD / uSunD, from the fog = horizon sky colour) is
+// calibrated so that an opaque puff of albedo a renders like a matte Lambertian sphere of albedo a under the same sky
+// (measured in the final tone-mapped image, 0.08 / 0.16 / 0.30 matched to within ~3 sRGB levels). An optically thick
+// cloud of a material then shows that material's bulk reflectance: wet soil clots ~0.06-0.08, slide-cloud crowns ~0.3,
+// their mud-and-water base ~0.14; thin veils use the single-scattering picture (water drops scatter almost everything,
+// mud fines absorb), so the impact mist sits between the wet ground and fog. Overcast light is blue (B/R ~1.3), so the
+// soil browns carry R/B ~1.5-2 in albedo, as real soils do.
 //
 // PHYSICAL MODEL (what is matched, see also the report in scratch/rain/):
 //   * Drop sizes: Marshall-Palmer N(D) = N0 exp(-Lambda D), Lambda = 4.1 R^-0.21 /mm, R = rain rate (mm/h) from env.rain.
@@ -190,6 +204,67 @@ function makePuffTexture(size = 192) {
   return tex;
 }
 
+/** 2x2 atlas of spray clusters (R = coverage), elongated along +y (the sprite is turned along its velocity).
+ *  Tiles 0-1: mud: a dense core of clots fraying into single clots (0.5-4 cm on a ~1 m sprite).
+ *  Tiles 2-3: water: sparse drops (0.3-1.5 cm, exposure-smeared) over a faint haze of unresolved droplets. */
+function makeSprayTexture(size = 128) {
+  const N = size * 2;
+  const acc = new Float32Array(N * N);
+  const rnd = mulberry(311);
+  const gauss = () => { let u = 0; for (let k = 0; k < 4; k++) u += rnd(); return (u - 2) * 0.866; };
+  for (let t = 0; t < 4; t++) {
+    const ox = (t % 2) * size, oy = Math.floor(t / 2) * size;
+    // dense core of unresolved droplets + a lopsided spread: the cluster is densest near its leading end (+y) and
+    // frays into single drops at its edges
+    const cxo = (rnd() - 0.5) * 0.06;
+    const water = t >= 2;
+    // mud: the sheet tears into several clumps strung along the path; water: one faint haze
+    const clumps = [];
+    if (water) clumps.push([cxo, 0.06, 0.07, 0.009, 0.022]);
+    else for (let k = 0; k < 6; k++) clumps.push([cxo + gauss() * 0.07, 0.04 + gauss() * 0.12, 0.2 + rnd() * 0.25, 0.0015 + rnd() * 0.003, 0.003 + rnd() * 0.006]);
+    const veil = water ? 0.07 : 0.08;
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const u = x / size - 0.5 - cxo, v = y / size - 0.5;
+      let a = veil * Math.exp(-(u * u) / 0.03 - (v * v) / 0.06);
+      for (const [cx, cy, I, sx, sy] of clumps) a += I * Math.exp(-((x / size - 0.5 - cx) ** 2) / sx - ((v - cy) ** 2) / sy);
+      acc[(oy + y) * N + ox + x] += a;
+    }
+    const n = water ? 110 + Math.floor(rnd() * 40) : 230 + Math.floor(rnd() * 70);
+    for (let k = 0; k < n; k++) {
+      const cx = gauss() * (water ? 0.15 : 0.12) + cxo, cy = gauss() * (water ? 0.19 : 0.16) + 0.04;
+      if (Math.hypot(cx, cy) > 0.42) continue;
+      // tile units: most drops small, a few big clots / drops
+      const r = water ? 0.003 + Math.pow(rnd(), 2.5) * 0.012 : 0.004 + Math.pow(rnd(), 3) * 0.03;
+      const el = water ? 2 + rnd() * 2.5 : 1.3 + rnd() * 1.6;  // exposure smear along +y
+      const I = 0.75 + rnd() * 0.25;
+      const x0 = Math.floor((cx - r * 2) * size + size / 2), x1 = Math.ceil((cx + r * 2) * size + size / 2);
+      const y0 = Math.floor((cy - r * el * 2) * size + size / 2), y1 = Math.ceil((cy + r * el * 2) * size + size / 2);
+      for (let y = Math.max(0, y0); y <= Math.min(size - 1, y1); y++) for (let x = Math.max(0, x0); x <= Math.min(size - 1, x1); x++) {
+        const du = ((x + 0.5) / size - 0.5 - cx) / r, dv = ((y + 0.5) / size - 0.5 - cy) / (r * el);
+        const q = du * du + dv * dv;
+        // anti-aliased disc (~1 texel edge)
+        const e = clamp((1 - Math.sqrt(q)) * r * size + 0.5, 0, 1);
+        acc[(oy + y) * N + ox + x] += e * I;
+      }
+    }
+  }
+  const data = new Uint8Array(N * N * 4);
+  for (let t = 0; t < 4; t++) {
+    const ox = (t % 2) * size, oy = Math.floor(t / 2) * size;
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const u = x / size - 0.5, v = y / size - 0.5, r = Math.hypot(u, v) * 2;
+      const i = (oy + y) * N + ox + x;
+      const val = clamp(acc[i], 0, 1) * clamp((0.96 - r) * 4, 0, 1);
+      data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = Math.round(val * 255); data[i * 4 + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true; tex.needsUpdate = true;
+  return tex;
+}
+
 // ================================================================================================= dust + mist (soft puffs)
 const DUST_VERT = /* glsl */`
 #include <common>
@@ -198,9 +273,10 @@ attribute vec3 iPos;
 attribute vec3 iVel;
 attribute vec4 iTime;   // x birth, y life, z ground y, w seed
 attribute vec4 iSize;   // x size0, y size1, z opacity, w buoyancy (m/s^2)
-attribute vec4 iCol;    // rgb albedo, a: 0 = sky-lit mist (flat, wide), 1 = lit dust
-attribute vec2 iExt;    // x aspect (width/height), y drag k (1/s)
+attribute vec4 iCol;    // rgb albedo, a: 0 = sky-lit mist (flat, wide), 1 = lit dust, 2 = spray (drops / mud clots)
+attribute vec4 iExt;    // x aspect (width/height), y drag k (1/s), z softness 0..1 (wet mist: blurred lobes), w spray: 1 = water
 uniform float uTime;
+uniform float uExpT;    // spray: exposure smear (s)
 uniform vec3 uWind;
 uniform vec3 uSunV;     // sun direction in view space
 uniform vec3 uUpV;      // world up in view space
@@ -214,18 +290,31 @@ varying vec2 vLight;
 varying vec2 vUpS;
 varying float vTile;
 varying float vAge;
+varying float vSoft;
 void main() {
   float age = uTime - iTime.x;
   float a = age / iTime.y;
   vAlpha = 0.0;
   if (a < 0.0 || a > 1.0) { ${CULL} return; }
   float k = max(iExt.y, 0.05);
-  vec3 p = iPos + iVel * (1.0 - exp(-k * age)) / k + uWind * age * 0.7 + vec3(0.0, 0.5 * iSize.w * age * age, 0.0);
+  float ek = exp(-k * age);
+  vec3 p = iPos + iVel * (1.0 - ek) / k + uWind * age * 0.7 + vec3(0.0, 0.5 * iSize.w * age * age, 0.0);
   float sz = mix(iSize.x, iSize.y, 1.0 - pow(1.0 - a, 2.4));
   float ang = iTime.w * 6.2831 + age * (fract(iTime.w * 7.13) - 0.5) * 0.35;
   if (iCol.a < 0.5) ang = (fract(iTime.w * 3.7) - 0.5) * 0.3;     // mist stays level
-  float cs = cos(ang), sn = sin(ang);
   vec2 c = position.xy * vec2(iExt.x, 1.0);
+  bool spray = iCol.a > 1.5;
+  if (spray) {
+    // a cluster of drops / mud clots on a ballistic path (iSize.w < 0: gravity against drag), aligned with and
+    // smeared along its screen-plane velocity over the exposure
+    vec3 vel = iVel * ek + uWind * 0.7 + vec3(0.0, iSize.w * age, 0.0);
+    vec2 sv = (mat3(viewMatrix) * vel).xy;
+    float sl = length(sv);
+    vec2 dir = sl > 1e-3 ? sv / sl : vec2(0.0, 1.0);
+    ang = atan(-dir.x, dir.y);
+    c = position.xy * vec2(1.0, 1.0 + sl * uExpT / max(sz, 0.05));
+  }
+  float cs = cos(ang), sn = sin(ang);
   vec2 rc = vec2(c.x * cs - c.y * sn, c.x * sn + c.y * cs);
   vec4 mvPosition = viewMatrix * vec4(p, 1.0);
   // pull the sprite toward the camera a little: less clipping into the ground/rocks it was spawned on
@@ -238,6 +327,9 @@ void main() {
   vUv = position.xy + 0.5;
   vTile = floor(fract(iTime.w * 13.7) * 4.0);
   vAlpha = iSize.z * smoothstep(0.0, 0.06, a) * (1.0 - smoothstep(0.55, 1.0, a)) * smoothstep(0.6, 4.0, -mvPosition.z);
+  if (spray) vAlpha = iSize.z * smoothstep(0.0, 0.03, a) * (1.0 - smoothstep(0.45, 1.0, a)) * smoothstep(0.3, 1.5, -mvPosition.z);
+  vSoft = iExt.z;
+  if (spray) vTile = iExt.w * 2.0 + step(0.5, fract(iTime.w * 13.7));   // mud tiles 0-1, water tiles 2-3
   vCol = iCol;
   vGround = iTime.z;
   vSize = sz;
@@ -253,8 +345,11 @@ const DUST_FRAG = /* glsl */`
 #include <fog_pars_fragment>
 ${SOFT_GLSL}
 uniform sampler2D uPuff;
+uniform sampler2D uSpray;
 uniform vec3 uAmb;
 uniform vec3 uSun;
+uniform vec3 uAmbD;     // lit dust: sky irradiance / pi (calibrated against a Lambertian sphere of the same albedo)
+uniform vec3 uSunD;     // lit dust: the bright cloud region ("sun")
 uniform float uTime;
 varying vec2 vUv;
 varying float vAlpha;
@@ -266,41 +361,60 @@ varying vec2 vLight;
 varying vec2 vUpS;
 varying float vTile;
 varying float vAge;
+varying float vSoft;
 vec2 tileUv(vec2 uv, float t) { return clamp(uv, 0.01, 0.99) * 0.5 + vec2(mod(t, 2.0), floor(t / 2.0)) * 0.5; }
 void main() {
   if (vAlpha <= 0.001) discard;
-  // slow internal boiling: the puff drifts against a second, counter-rotating lobe field
   vec2 cuv = vUv - 0.5;
+  vec2 eq = min(vUv, 1.0 - vUv);
+  if (vCol.a > 1.5) {
+    // spray: resolved drops / clots (their own atlas), lit like the dust, landing on the ground it was thrown from
+    float sd = texture2D(uSpray, tileUv(vUv, vTile)).r;
+    float sa = sd * vAlpha * smoothstep(0.0, 0.1, min(eq.x, eq.y));
+    float stop = mix(0.72, 1.08, smoothstep(-0.3, 0.3, dot(cuv, vUpS)));
+    vec3 scol = vCol.rgb * (uAmbD * 0.92 * stop + uSunD * 0.75);
+    sa *= smoothstep(vGround - 0.02, vGround + 0.05, vWorld.y) * softFade(0.12);
+    if (sa < 0.004) discard;
+    gl_FragColor = vec4(scol, sa);
+    #include <fog_fragment>
+    return;
+  }
+  // slow internal boiling: the puff drifts against a second, counter-rotating lobe field
   float bt = vAge * 1.6 + vTile;
   vec2 w1 = vec2(cos(bt), sin(bt)) * 0.035 * vAge;
-  float d = texture2D(uPuff, tileUv(vUv + w1, vTile)).r;
-  if (d < 0.01) discard;
+  // wet mist (vSoft): the fine droplets and mud fines do not hold crisp cauliflower lobes: sample blurred mips
+  float lb = vSoft * 1.8;
+  float d = texture2D(uPuff, tileUv(vUv + w1, vTile), lb).r;
+  // (blurred lobes spread thin density wide: cull the faint fringe, it costs blending but is invisible)
+  if (d < 0.01 + 0.07 * vSoft) discard;
   if (vCol.a > 0.5) {   // dust only: the mist is a thin veil, one sample is enough
-    float d2 = texture2D(uPuff, tileUv(0.5 + mat2(0.8, -0.6, 0.6, 0.8) * cuv * 1.35 - w1, mod(vTile + 1.0, 4.0))).r;
-    d = mix(d, d * (0.55 + 0.9 * d2), 0.55);
+    float d2 = texture2D(uPuff, tileUv(0.5 + mat2(0.8, -0.6, 0.6, 0.8) * cuv * 1.35 - w1, mod(vTile + 1.0, 4.0)), lb).r;
+    d = mix(d, d * (0.55 + 0.9 * d2), 0.55 * (1.0 - 0.5 * vSoft));
   }
   // erosion: as the cloud ages and thins, its edges fray first (threshold rises), instead of a uniform fade
   float thr = 0.04 + 0.32 * vAge * vAge;
   float dens = clamp((d - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
   // quad-edge fade: at low mips the neighbouring atlas tile bleeds in, never let that draw the sprite's rectangle
-  vec2 eq = min(vUv, 1.0 - vUv);
-  float alpha = smoothstep(0.0, 0.65, dens) * vAlpha * smoothstep(0.0, 0.12, min(eq.x, eq.y));
+  float alpha = smoothstep(0.0, 0.65 + 0.3 * vSoft, dens) * vAlpha * smoothstep(0.0, 0.12 + 0.1 * vSoft, min(eq.x, eq.y));
   vec3 col;
   if (vCol.a > 0.5) {
     // single-scattering proxy: density gradient toward the sun and toward the bright overcast above
-    float dl = texture2D(uPuff, tileUv(vUv + normalize(vLight + 1e-4) * 0.07, vTile)).r;
-    float du = texture2D(uPuff, tileUv(vUv + normalize(vUpS + 1e-4) * 0.08, vTile)).r;
+    float dl = texture2D(uPuff, tileUv(vUv + normalize(vLight + 1e-4) * 0.07, vTile), lb).r;
+    float du = texture2D(uPuff, tileUv(vUv + normalize(vUpS + 1e-4) * 0.08, vTile), lb).r;
     float sunSh = clamp(0.6 + (d - dl) * 3.0, 0.12, 1.3);
     float skySh = clamp(0.78 + (d - du) * 2.4, 0.3, 1.2);
     float core = mix(1.0, 0.72, smoothstep(0.35, 0.95, d));       // optically thick cores are darker
-    col = vCol.rgb * (uAmb * skySh * core + uSun * sunSh);
+    // lit from above: under an overcast sky the irradiance comes from the upper hemisphere, so the underside of each
+    // billow sits in the shadow of the billow itself (field footage: bright grey-brown crowns over a dark base)
+    float top = mix(0.52, 1.15, smoothstep(-0.32, 0.32, dot(cuv, vUpS)));
+    col = vCol.rgb * (uAmbD * skySh * core * top + uSunD * sunSh * (0.35 + 0.65 * top));
   } else {
     col = vCol.rgb * uAmb;                                          // rain mist: sky-lit, forward-scattering
   }
   // soft intersection with the ground it was spawned on, and with any opaque geometry (scene depth)
   alpha *= smoothstep(vGround - 0.05, vGround + max(vSize * (vCol.a > 0.5 ? 0.3 : 0.12), 0.1), vWorld.y);
   alpha *= softFade(max(vSize * (vCol.a > 0.5 ? 0.35 : 0.5), 0.2));
-  if (alpha < 0.002) discard;
+  if (alpha < 0.002 + 0.002 * vSoft) discard;
   gl_FragColor = vec4(col, alpha);
   #include <fog_fragment>
 }`;
@@ -312,14 +426,16 @@ class DustSystem {
     g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0]), 3));
     g.setIndex([0, 1, 2, 0, 2, 3]);
     const mk = (n, nm) => { const a = new THREE.InstancedBufferAttribute(new Float32Array(cap * n), n); a.setUsage(THREE.DynamicDrawUsage); g.setAttribute(nm, a); return a; };
-    this.aPos = mk(3, 'iPos'); this.aVel = mk(3, 'iVel'); this.aTime = mk(4, 'iTime'); this.aSize = mk(4, 'iSize'); this.aCol = mk(4, 'iCol'); this.aExt = mk(2, 'iExt');
+    this.aPos = mk(3, 'iPos'); this.aVel = mk(3, 'iVel'); this.aTime = mk(4, 'iTime'); this.aSize = mk(4, 'iSize'); this.aCol = mk(4, 'iCol'); this.aExt = mk(4, 'iExt');
     for (let i = 0; i < cap; i++) this.aTime.array[i * 4] = -1e6;
     g.instanceCount = cap;
     this.soft = expectSoft(ctx);
     this.uniforms = {
       ...fogUniforms(ctx), ...softUniforms(),
-      uTime: { value: 0 }, uWind: { value: new THREE.Vector3(0.6, 0, 0.25) }, uSunV: { value: new THREE.Vector3(0, 1, 0) }, uUpV: { value: new THREE.Vector3(0, 1, 0) },
+      uTime: { value: 0 }, uExpT: { value: 0.03 }, uWind: { value: new THREE.Vector3(0.6, 0, 0.25) }, uSunV: { value: new THREE.Vector3(0, 1, 0) }, uUpV: { value: new THREE.Vector3(0, 1, 0) },
       uPuff: { value: DustSystem.puff || (DustSystem.puff = makePuffTexture()) }, uAmb: { value: new THREE.Color(0.62, 0.66, 0.72) }, uSun: { value: new THREE.Color(0.55, 0.52, 0.47) },
+      uAmbD: { value: new THREE.Color(0.39, 0.44, 0.52) }, uSunD: { value: new THREE.Color(0.16, 0.152, 0.14) },
+      uSpray: { value: DustSystem.spray || (DustSystem.spray = makeSprayTexture()) },
     };
     this.mat = new THREE.ShaderMaterial({
       uniforms: this.uniforms, vertexShader: DUST_VERT, fragmentShader: DUST_FRAG,
@@ -333,15 +449,16 @@ class DustSystem {
     this._dirtyLo = Infinity; this._dirtyHi = -1;
     this.time = 0;
   }
-  /** lit: 1 = dust (sun + sky self-shadowing), 0 = rain mist (flat sky-lit). aspect > 1 = wide sprite. drag k (1/s). */
-  emit(p, vel, life, size0, size1, opacity, col, ground, buoy = 0.15, lit = 1, aspect = 1, drag = 1.3) {
+  /** lit: 1 = dust (sun + sky self-shadowing), 0 = rain mist (flat sky-lit), 2 = spray (drops / mud clots on a ballistic
+   *  path: buoy < 0 is its net fall acceleration). aspect > 1 = wide sprite. drag k (1/s). soft 0..1 = wet, blurred mist. */
+  emit(p, vel, life, size0, size1, opacity, col, ground, buoy = 0.15, lit = 1, aspect = 1, drag = 1.3, soft = 0, water = 0) {
     const i = this.head; this.head = (this.head + 1) % this.cap;
     this.aPos.array.set([p.x, p.y, p.z], i * 3);
     this.aVel.array.set([vel.x, vel.y, vel.z], i * 3);
     this.aTime.array.set([this.time, life, ground, Math.random()], i * 4);
     this.aSize.array.set([size0, size1, opacity, buoy], i * 4);
     this.aCol.array.set([col.r, col.g, col.b, lit], i * 4);
-    this.aExt.array.set([aspect, drag], i * 2);
+    this.aExt.array.set([aspect, drag, soft, water], i * 4);
     this._dirtyLo = Math.min(this._dirtyLo, i); this._dirtyHi = Math.max(this._dirtyHi, i);
   }
   update(dt) {
@@ -349,7 +466,7 @@ class DustSystem {
     this.uniforms.uTime.value = this.time;
     if (this._dirtyHi >= 0) {
       const lo = this._dirtyLo, n = this._dirtyHi - lo + 1;
-      for (const [a, k] of [[this.aPos, 3], [this.aVel, 3], [this.aTime, 4], [this.aSize, 4], [this.aCol, 4], [this.aExt, 2]]) {
+      for (const [a, k] of [[this.aPos, 3], [this.aVel, 3], [this.aTime, 4], [this.aSize, 4], [this.aCol, 4], [this.aExt, 4]]) {
         a.clearUpdateRanges(); a.addUpdateRange(lo * k, n * k); a.needsUpdate = true;
       }
       this._dirtyLo = Infinity; this._dirtyHi = -1;
@@ -443,8 +560,8 @@ class ChipSystem {
           // growth rings / fibres run along the splinter (local z): fine lengthwise stripes, latewood darker
           float chGr = fract(sin(floor(vChL.x * 3.5 + vChL.y * 2.0 + vShade * 17.0) * 43.7) * 7613.1);
           chWood *= 0.8 + 0.2 * chGr - 0.1 * smoothstep(0.85, 1.0, abs(vChL.z) / 2.0);
-          diffuseColor.rgb = vKind < 0.5 ? vec3(0.19, 0.18, 0.165) * vShade : (vKind < 1.5 ? vec3(0.06, 0.045, 0.032) * vShade : chWood);`)
-        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = vKind < 0.5 ? 0.72 : (vKind < 1.5 ? 0.22 : 0.6);');
+          diffuseColor.rgb = vKind < 0.5 ? vec3(0.175, 0.168, 0.155) * vShade : (vKind < 1.5 ? vec3(0.06, 0.045, 0.032) * vShade : chWood);`)
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = vKind < 0.5 ? 0.6 : (vKind < 1.5 ? 0.22 : 0.6);');
     };
     mat.customProgramCacheKey = () => 'fxchip2';
     this.mesh = new THREE.Mesh(g, mat);
@@ -1434,8 +1551,11 @@ export default class Particles {
     const q = ctx.config?.quality ?? {};
     const key = q.key || 'high';
     try { const mod = await import('../render/impostor.js'); this.WIND = mod.WIND; } catch { this.WIND = null; }
-    this.dustSys = new DustSystem(ctx, 1400);
-    this.chips = new ChipSystem(ctx, 900);
+    // effect budgets per preset: Ultra/High keep the full pools; Medium/Low emit fewer sprites/chips per event and
+    // keep smaller pools (the rain pools below are shared with the rain and stay as they are)
+    this.fxQ = FX_Q[key] ?? 1;
+    this.dustSys = new DustSystem(ctx, key === 'low' ? 600 : key === 'medium' ? 1000 : 1400);
+    this.chips = new ChipSystem(ctx, key === 'low' ? 400 : key === 'medium' ? 600 : 900);
     this.rain = new RainSystem(ctx, Math.round(30000 * (q.rain ?? 0.8)), this.shared);
     this.drops = new DropSystem(ctx, 1600, this.shared);
     this.splashes = new SplashSystem(ctx, 1600, this.shared);
@@ -1455,12 +1575,14 @@ export default class Particles {
   }
 
   // ---------------------------------------------------------------------------------------------- API
-  /** Dust / spray burst. size ≈ radius of the initial cloud (m); energy ≈ KE/1e5 scales count, spread and lift. */
+  /** Dust / spray burst. size ≈ radius of the initial cloud (m); energy ≈ KE/1e5 scales count, spread and lift.
+   *  Slide dust in the rain: brownish grey, lit from above, densest and darkest at the base (mud + water spray) where
+   *  the surge rolls out; the rain scavenges it within a few seconds. */
   dust(pos, size = 1, energy = 0.5) {
     if (!this.dustSys || !pos) return;
     const e = clamp(energy, 0, 20);
     // budget: a wet slope does not turn into a white-out, however many rocks bounce
-    let n = Math.round(clamp(1.5 + Math.sqrt(e) * 2.5 + size * 0.6, 2, 9));
+    let n = Math.round(clamp(1.5 + Math.sqrt(e) * 2.5 + size * 0.6, 2, 9) * this.fxQ);
     n = Math.min(n, Math.floor(this._dustBudget));
     if (n <= 0) return;
     this._dustBudget -= n;
@@ -1472,25 +1594,91 @@ export default class Particles {
       _v.set(Math.cos(a) * sp, (0.4 + Math.random() * 1.0) * sp * 0.8, Math.sin(a) * sp);
       _w.set(pos.x + Math.cos(a) * r * size * 0.5, Math.max(pos.y + Math.random() * size * 0.4, ground + size * 0.3), pos.z + Math.sin(a) * r * size * 0.5);
       const s0 = size * (0.45 + Math.random() * 0.45), s1 = size * (1.5 + Math.random() * 1.3) + Math.sqrt(e) * 0.8;
-      // freshly crushed gneiss / granite powder, darkened by the rain (wet: darker, browner, shorter-lived)
-      const t = Math.random();
-      // (QA) x0.6: an optically thick cloud of rock powder looks like the bulk powder (albedo ~0.3-0.35 dry, ~0.2
-      // wet) under the same sky, i.e. about as bright as the concrete headwall, well below the overcast sky; the old
-      // values rendered it cotton-white
-      const col = _col.setRGB(lerp(0.36, 0.3, wet) + t * 0.05, lerp(0.33, 0.26, wet) + t * 0.04, lerp(0.29, 0.21, wet) + t * 0.03).multiplyScalar(0.6);
-      this.dustSys.emit(_w, _v, (2.5 + Math.random() * 3.5) * (0.7 + size * 0.15) * lerp(1.3, 0.8, wet), s0, s1, lerp(0.55, 0.36, wet) * (0.5 + Math.random() * 0.5), col, ground, 0.1 + Math.random() * 0.2);
+      // crushed gneiss / granite fines + soil, brownish grey (bulk albedo ~0.2, wet), lighter the higher it rides
+      const col = palMix(_col, PAL.slideBase, PAL.slideTop, 0.45 + Math.random() * 0.55, 0.08);
+      this.dustSys.emit(_w, _v, (2.5 + Math.random() * 3.5) * (0.7 + size * 0.15) * lerp(1.3, 0.75, wet), s0, s1, lerp(0.55, 0.36, wet) * (0.5 + Math.random() * 0.5), col, ground, 0.1 + Math.random() * 0.2, 1, 1, 1.3, wet * 0.4);
     }
-    // base surge: the densest part of the cloud rolls out along the ground first
+    // base surge: the densest part of the cloud rolls out along the ground first (mud + water: dark, dirty brown)
     if (e > 0.25 && this._dustBudget >= 1) {
-      const k = Math.min(Math.floor(this._dustBudget), e > 1.5 ? 3 : 2);
+      const k = Math.min(Math.floor(this._dustBudget), Math.max(1, Math.round((e > 1.5 ? 3 : 2) * this.fxQ)));
       this._dustBudget -= k;
       for (let i = 0; i < k; i++) {
         const a = Math.random() * Math.PI * 2, sp = (2.5 + Math.sqrt(e) * 2.2) * (0.7 + Math.random() * 0.6);
         _v.set(Math.cos(a) * sp, 0.25 + Math.random() * 0.4, Math.sin(a) * sp);
         _w.set(pos.x, Math.max(pos.y, ground + size * 0.25), pos.z);
-        const t = Math.random();
-        const col = _col.setRGB(lerp(0.33, 0.27, wet) + t * 0.04, lerp(0.3, 0.235, wet) + t * 0.03, lerp(0.26, 0.19, wet) + t * 0.03).multiplyScalar(0.6);
-        this.dustSys.emit(_w, _v, (3 + Math.random() * 2.5) * lerp(1.2, 0.85, wet), size * 0.6, size * (2.2 + Math.random()) + Math.sqrt(e), lerp(0.45, 0.3, wet), col, ground, 0.05, 1, 1.35, 1.9);
+        const col = palMix(_col, PAL.slideBase, PAL.slideTop, Math.random() * 0.25, 0.06);
+        this.dustSys.emit(_w, _v, (3 + Math.random() * 2.5) * lerp(1.2, 0.8, wet), size * 0.6, size * (2.2 + Math.random()) + Math.sqrt(e), lerp(0.5, 0.4, wet), col, ground, 0.03, 1, 1.45, 1.9, 0.6);
+      }
+    }
+  }
+
+  /**
+   * Rock impact on the ground: what a block hitting a wet mountain road throws (sprites, chips, drops, splashes).
+   *   soil (scar mud, ditch, forest soil, the debris mass): dark brown mud spray + clots, a low, short-lived
+   *        grey-brown mist that barely rises (wet fines do not loft);
+   *   asphalt / rock: grey rock chips, a fan of water spray off the wet surface, splash crowns, a thin grey mist of
+   *        crushed rock and water that the rain knocks down in 1-2 s;
+   *   gravel: in between.
+   * opts: {energy (≈KE/1e5), radius (m), surface ('soil'|'mud'|'dirt'|'grass'|'asphalt'|'rock'|'gravel'|null = look up),
+   *        first = true (first hard hit of this block: the full splash; later bounces throw less), ground (y)}
+   */
+  impact(pos, opts = {}) {
+    if (!pos || !this.dustSys) return;
+    const e = clamp(opts.energy ?? 0.5, 0, 30), r = clamp(opts.radius ?? 0.5, 0.05, 2.5), se = Math.sqrt(e);
+    const cls = this._surfClass(pos, opts.surface);
+    const soil = cls === 'soil', paved = cls === 'hard', rocky = cls === 'rock' || paved;
+    const Q = this.fxQ, first = opts.first !== false;
+    const cam = this.ctx.camera.position;
+    const dist = pos.distanceTo(cam);
+    const ground = opts.ground ?? this._ground(pos);
+    const D = this.dustSys;
+    const gy = Math.max(ground, pos.y - r * 0.9);
+    // 1) spray: a crown of mud clots (soil) or of water + grit (paved / rock), on short ballistic arcs (< 1 s)
+    if (dist < (Q < 1 ? 40 + 120 * Q : 160)) {
+      const n = Math.round(clamp(1.5 + se * 2.4 + r * 2.2, 2, 11) * Q * (first ? 1 : 0.5));
+      const pw = soil ? 0.12 : cls === 'gravel' ? 0.4 : 0.6;         // share of water spray
+      for (let i = 0; i < n; i++) {
+        const water = Math.random() < pw;
+        const az = Math.random() * Math.PI * 2;
+        // a wet paved surface throws its water film out low and flat; soil is punched up in a steeper crown
+        const el = water ? 0.2 + Math.random() * 0.6 : 0.55 + Math.random() * 0.7;
+        const sp = Math.min(11, (2.5 + se * 2.2) * (0.6 + Math.random() * 0.7));
+        _v.set(Math.cos(az) * Math.cos(el) * sp, Math.sin(el) * sp, Math.sin(az) * Math.cos(el) * sp);
+        _w.set(pos.x + Math.cos(az) * r * 0.5, gy + 0.08 + Math.random() * r * 0.3, pos.z + Math.sin(az) * r * 0.5);
+        const s0 = (water ? 0.3 : 0.2) + r * 0.4, s1 = (water ? 0.9 : 0.7) + r * 1.2 + se * 0.35;
+        const col = water ? palMix(_col, PAL.water, PAL.water, 0, 0.05) : palMix(_col, PAL.mud, PAL.mud, 0, 0.12);
+        // water: a thin sheet of drops (mostly see-through); mud: dense clusters of clots
+        D.emit(_w, _v, water ? 0.4 + Math.random() * 0.3 : 0.6 + Math.random() * 0.5, s0, s1,
+          water ? 0.2 + Math.random() * 0.15 : 0.8 + Math.random() * 0.15, col, ground, -7.5, 2, 1, water ? 1.8 : 0.9, 0, water ? 1 : 0);
+      }
+    }
+    // 2) clots / chips: wet clods from soil, fresh grey fragments off a block hitting asphalt or rock
+    if (dist < 160) {
+      const cnt = Math.round(clamp(4 + e * 5 + r * 4, 4, 22) * Q * (first ? 1 : 0.6));
+      this.debris(pos, Math.max(2, cnt), { speed: 3 + se * 3, mud: soil ? 0.85 : cls === 'gravel' ? 0.45 : 0.15, up: soil ? 1 : 0.8, dropScale: paved ? 1.4 : 1 });
+    }
+    // 3) splash crowns where the block slaps the water film on the road
+    if (paved && this.splashes && dist < 70) {
+      const n = Math.round(clamp(3 + se * 4, 3, 12) * Q);
+      for (let i = 0; i < n; i++) {
+        const a = Math.random() * Math.PI * 2, rr = r * (0.6 + Math.random() * 1.2);
+        this.splashes.emit(_w.set(pos.x + Math.cos(a) * rr, ground + 0.004, pos.z + Math.sin(a) * rr), 0.1 + Math.random() * 0.14, 0.14 + Math.random() * 0.1, Math.random() * 0.05);
+      }
+    }
+    // 4) the low mist: grey-brown over soil, grey over rock / asphalt; rolls out, barely rises, gone in 1.5-3 s
+    let m = Math.round(clamp((soil ? 0.8 : 0.5) + se * 1.1 + r * 1.4, 1, 4) * Q * (first ? 1 : 0.5));
+    m = Math.min(m, Math.floor(this._dustBudget));
+    if (m > 0) {
+      this._dustBudget -= m;
+      const pal = soil ? PAL.soilMist : rocky ? PAL.rockMist : PAL.gravelMist;
+      for (let i = 0; i < m; i++) {
+        const a = Math.random() * Math.PI * 2, sp = (0.8 + se * 0.9) * (0.6 + Math.random() * 0.8);
+        _v.set(Math.cos(a) * sp, 0.15 + Math.random() * 0.4, Math.sin(a) * sp);
+        const s0 = 0.35 + r * 0.8;
+        _w.set(pos.x + Math.cos(a) * r * 0.4, gy + s0 * 0.3 + Math.random() * 0.2, pos.z + Math.sin(a) * r * 0.4);
+        const col = palMix(_col, pal, pal, 0, 0.08);
+        D.emit(_w, _v, (soil ? 1.8 + Math.random() * 1.4 : 1.2 + Math.random() * 1.1) * (0.8 + r * 0.3), s0, 1.2 + r * 1.6 + se * 0.8,
+          (soil ? 0.38 + Math.random() * 0.14 : 0.3 + Math.random() * 0.14), col, ground, 0.02 + Math.random() * 0.06, 1, 1.35, 1.7, 0.6);
       }
     }
   }
@@ -1514,7 +1702,7 @@ export default class Particles {
     }
     // water knocked off wet rock and mud: a spray of drops
     if (!opts.wood && this.drops) {
-      const nd = Math.min(24, Math.round(count * 1.2));
+      const nd = Math.min(28, Math.round(count * 1.2 * (opts.dropScale ?? 1)));
       for (let i = 0; i < nd; i++) {
         const a = Math.random() * Math.PI * 2, s = spd * (0.4 + Math.random() * 0.9);
         _v.set(Math.cos(a) * s * 0.8, (0.6 + Math.random()) * s * 0.7, Math.sin(a) * s * 0.8);
@@ -1548,6 +1736,16 @@ export default class Particles {
     return pos.y - 1;
   }
 
+  /** Surface class of an impact point: 'soil' | 'hard' (asphalt, concrete, planks) | 'rock' | 'gravel'. */
+  _surfClass(pos, hint) {
+    let t = hint;
+    if (t == null) { try { t = this.ctx.terrain?.surfaceAt?.(pos); } catch { t = null; } }
+    if (t === 'asphalt' || t === 'hard' || t === 'wood' || t === 'concrete') return 'hard';
+    if (t === 'rock') return 'rock';
+    if (t === 'gravel') return 'gravel';
+    return 'soil';
+  }
+
   _onImpact(p) {
     if (!p?.position || this._impactsThisFrame > 6) return;
     this._impactsThisFrame++;
@@ -1556,15 +1754,43 @@ export default class Particles {
     if (dist > 450) return;
     const e = p.energy ?? 0.5, r = p.radius ?? 0.5;
     if (p.source === 'car') {
-      if (e > 0.05) this.debris(p.position, 6, { speed: 3, mud: 0.6 });
+      if (e > 0.05) this.debris(p.position, Math.max(2, Math.round(6 * this.fxQ)), { speed: 3, mud: 0.6 });
       return;
     }
     if (e < 0.03) return;
-    const front = p.source === 'front';
-    const repeat = 1 / Math.max(1, p.hits ?? 1);   // the first hit throws the most dust
-    const size = clamp(r * 1.3 + Math.sqrt(e) * 0.9, 0.4, 7) * (front ? 0.6 : 1);
-    if (repeat > 0.3 || e > 1) this.dust(p.position, size * (0.6 + 0.4 * repeat), (front ? e * 0.3 : e) * repeat);
-    if (p.source !== 'front' && dist < 160) this.debris(p.position, Math.round(clamp(4 + e * 5, 4, 22)), { speed: 3 + Math.sqrt(e) * 3, mud: 0.4 });
+    if (p.source === 'front') { this._frontImpact(p.position, e, r, dist); return; }
+    const repeat = 1 / Math.max(1, p.hits ?? 1);   // the first hit throws the most
+    this.impact(p.position, { energy: e * (0.4 + 0.6 * repeat), radius: r, surface: p.surface, first: repeat > 0.3 || e > 1, ground: p.ground });
+  }
+
+  /** Grinding / snapping at the snout of the debris front: mud clots flung off and a low dirty-brown mist. */
+  _frontImpact(pos, e, r, dist) {
+    const D = this.dustSys;
+    if (!D) return;
+    const ground = this._ground(pos), se = Math.sqrt(e);
+    const Q = this.fxQ;
+    if (dist < 140) {
+      const n = Math.round(clamp(1 + se * 3, 1, 5) * Q + 0.3);
+      for (let i = 0; i < n; i++) {
+        const az = Math.random() * Math.PI * 2, el = 0.5 + Math.random() * 0.8, sp = 2.5 + se * 2.5 * Math.random();
+        _v.set(Math.cos(az) * Math.cos(el) * sp, Math.sin(el) * sp, Math.sin(az) * Math.cos(el) * sp);
+        _w.set(pos.x, Math.max(pos.y, ground + 0.2), pos.z);
+        const water = Math.random() < 0.3;
+        const col = water ? palMix(_col, PAL.water, PAL.water, 0, 0.05) : palMix(_col, PAL.mud, PAL.mud, 0, 0.12);
+        D.emit(_w, _v, 0.6 + Math.random() * 0.4, 0.3 + r * 0.3, 0.9 + r * 0.8, water ? 0.45 : 0.8, col, ground, -7.5, 2, 1, 1.0, 0, water ? 1 : 0);
+      }
+    }
+    let m = Math.min(Math.round(clamp(se * 2, 0, 2) * Q + 0.4), Math.floor(this._dustBudget));
+    if (m > 0) {
+      this._dustBudget -= m;
+      for (let i = 0; i < m; i++) {
+        const a = Math.random() * Math.PI * 2, sp = 1 + se;
+        _v.set(Math.cos(a) * sp, 0.3 + Math.random() * 0.5, Math.sin(a) * sp);
+        _w.set(pos.x, Math.max(pos.y, ground + 0.5), pos.z);
+        const col = palMix(_col, PAL.frontBase, PAL.frontBase, 0, 0.08);
+        D.emit(_w, _v, 2.5 + Math.random() * 1.5, 1 + r, 3 + r * 2 + se, 0.24 + Math.random() * 0.12, col, ground, 0.05, 1, 1.5, 1.6, 0.65);
+      }
+    }
   }
 
   _updateFront(dt) {
@@ -1576,24 +1802,44 @@ export default class Particles {
     if (dist > 600) return;
     const sp = L.front.speed ?? 0, h = L.front.height ?? 4;
     const growth = clamp(h / 4.4, 0, 1);
-    // continuous churning cloud of spray and rock dust along the snout
-    this._frontAcc += dt * (2.5 + sp * 2.5) * growth;
+    const Q = this.fxQ;
+    // continuous churning cloud along the snout: mostly a mud-and-water mist hugging its base (dirty brown, dense),
+    // thinning into grey-brown above it
+    this._frontAcc += dt * (2.5 + sp * 2.5) * growth * Q;
     const wet = this.ctx.env?.wetness ?? 0.75;
     let n = 0;
+    const tg = road.tangentAt(L.front.visS, _b);
     while (this._frontAcc >= 1 && n++ < 12) {
       this._frontAcc -= 1;
       const d = lerp(-6.5, 3, Math.random());
+      const base = Math.random() < 0.68;
+      if (base) {
+        // the leading edge: a dense, low sheet of mud and water spray pushed ahead of the snout; it is overrun and
+        // swallowed within ~2 s, so it lives about that long
+        const sAt = L.front.visS + 7 + Math.random() * 2.5;
+        road.worldAt(sAt, d, _w);
+        const gy = L.surfaceY?.(sAt, d) ?? _w.y;
+        const ground = Math.min(gy, _w.y);
+        _w.y = Math.max(gy, _w.y) + 0.3 + Math.random() * h * 0.2;
+        _v.copy(tg).multiplyScalar(sp * (1.05 + Math.random() * 0.25) + 0.5);
+        _v.x += (Math.random() - 0.5) * 1.2; _v.z += (Math.random() - 0.5) * 1.2; _v.y = 0.2 + Math.random() * 0.6;
+        const col = palMix(_col, PAL.frontBase, PAL.frontBase, 0, 0.08);
+        this.dustSys.emit(_w, _v, 1.8 + Math.random() * 1.2, 1.4 + Math.random() * 1.2, 3.6 + Math.random() * 2.5 + sp * 0.2,
+          (0.11 + Math.random() * 0.1) * lerp(1.15, 0.9, wet), col, ground, 0.03, 1, 1.7, 0.35, 0.6);
+        continue;
+      }
       L.frontPoint(d, _w);
-      _w.y += Math.random() * h * 0.5;
-      _v.set(0, 0.6 + Math.random() * 1.2, 0).addScaledVector(road.tangentAt(L.front.visS, _u), sp * (0.9 + Math.random() * 0.5));
-      const t = Math.random();
-      const col = _col.setRGB(0.2 + t * 0.04, 0.19 + t * 0.035, 0.175 + t * 0.03);
-      const ground = _w.y - Math.random() * h;
-      this.dustSys.emit(_w, _v, 4 + Math.random() * 4, 1.6 + Math.random() * 1.8, 5 + Math.random() * 5 + sp * 0.4, (0.08 + Math.random() * 0.12) * lerp(1.2, 0.8, wet), col, ground, 0.04 + Math.random() * 0.1);
+      const hf = 0.25 + Math.random() * 0.45;
+      _w.y += hf * h;
+      _v.set(0, 0.7 + Math.random() * 1.1, 0).addScaledVector(tg, sp * (0.9 + Math.random() * 0.5));
+      const col = palMix(_col, PAL.frontBase, PAL.slideTop, 0.35 + Math.random() * 0.4, 0.06);
+      const ground = _w.y - (0.3 + hf) * h;
+      this.dustSys.emit(_w, _v, 4 + Math.random() * 3.5, 1.6 + Math.random() * 1.8, 5 + Math.random() * 5 + sp * 0.4,
+        (0.07 + Math.random() * 0.09) * lerp(1.2, 0.85, wet), col, ground, 0.05 + Math.random() * 0.1, 1, 1.1, 1.3, 0.4);
     }
-    // mud + stones thrown off the rolling leading edge
+    // mud + stones thrown off the rolling leading edge (clots as meshes, the finer spray as sprites)
     if (dist < 160) {
-      this._sprayAcc += dt * (1.5 + sp * 2.2) * growth;
+      this._sprayAcc += dt * (1.5 + sp * 2.2) * growth * Q;
       let k = 0;
       while (this._sprayAcc >= 1 && k++ < 6) {
         this._sprayAcc -= 1;
@@ -1601,6 +1847,13 @@ export default class Particles {
         _w.y += h * (0.2 + Math.random() * 0.6);
         const fw = road.tangentAt(L.front.visS, _u).clone();
         this.debris(_w, 3, { speed: 2 + sp * 0.6, mud: 0.7, up: 0.8, dir: fw });
+        if (Math.random() < 0.8) {
+          const water = Math.random() < 0.3;
+          _v.copy(fw).multiplyScalar(sp * (0.9 + Math.random() * 0.4) + 1 + Math.random() * 3);
+          _v.x += (Math.random() - 0.5) * 3; _v.z += (Math.random() - 0.5) * 3; _v.y = 1.5 + Math.random() * 3.5;
+          const col = water ? palMix(_col, PAL.water, PAL.water, 0, 0.05) : palMix(_col, PAL.mud, PAL.mud, 0, 0.12);
+          this.dustSys.emit(_w, _v, 0.6 + Math.random() * 0.5, 0.35, 1.1 + Math.random() * 0.6, water ? 0.45 : 0.8, col, _w.y - h * 0.8, -7.5, 2, 1, 1.0, 0, water ? 1 : 0);
+        }
       }
     }
   }
@@ -1900,8 +2153,9 @@ export default class Particles {
     this._impactsThisFrame = 0;
     this.time += dt;
     this._boostT = Math.max(0, (this._boostT || 0) - dt);
-    const cap = this._boostT > 0 ? 160 : 60;
-    this._dustBudget = Math.min((this._dustBudget ?? 40) + dt * (this._boostT > 0 ? 200 : 45), cap);
+    const fq = this.fxQ ?? 1;
+    const cap = (this._boostT > 0 ? 160 : 60) * fq;
+    this._dustBudget = Math.min((this._dustBudget ?? 40 * fq) + dt * (this._boostT > 0 ? 200 : 45) * fq, cap);
     const cam = ctx.camera.position;
     if (dt > 0) {
       _v.subVectors(cam, this._camPrev).divideScalar(dt);
@@ -1923,6 +2177,14 @@ export default class Particles {
       const inT = ctx.terrain?.insideTunnel?.(cam) ?? 0;
       D.uniforms.uAmb.value.setRGB(0.62 + fl, 0.66 + fl, 0.72 + fl).multiplyScalar(1 - 0.85 * inT);
       D.uniforms.uSun.value.setRGB(0.55, 0.52, 0.47).multiplyScalar(1 - inT);
+      // (DUST) lit dust tracks the horizon sky radiance (fog colour, as the rain does). Calibrated in scratch/dust/calib.js:
+      // an opaque puff of albedo a now renders like a matte sphere of albedo a under the same sky (it was ~2.2x brighter
+      // and warm-neutral where the scene is cool, which is what made the rockfall dust read as white cotton)
+      const fc = ctx.scene.fog?.color;
+      if (fc) D.uniforms.uAmbD.value.copy(fc).multiplyScalar(DUST_AMB_K);
+      else D.uniforms.uAmbD.value.setRGB(0.6, 0.68, 0.8).multiplyScalar(DUST_AMB_K);
+      D.uniforms.uAmbD.value.multiplyScalar((1 + fl * 1.6) * (1 - 0.85 * inT));
+      D.uniforms.uSunD.value.setRGB(1.0, 0.95, 0.88).multiplyScalar(DUST_SUN_K * (1 - inT));
       // soft particles: share post's opaque-depth copy (null with ?nopost)
       if (D.soft) {
         const du = ctx.post?.depthUniforms;
@@ -1951,3 +2213,27 @@ export default class Particles {
 }
 
 const _col = new THREE.Color();
+const DUST_AMB_K = 0.65, DUST_SUN_K = 0.16;
+// per-preset multiplier on effect sprite / chip counts (Ultra and High unchanged)
+const FX_Q = { ultra: 1, high: 1, medium: 0.5, low: 0.3 };
+// Bulk albedos (linear sRGB) of what a rockfall throws in the rain. An optically thick cloud of a material looks like
+// that material's bulk reflectance under the same sky (the lit-dust shading is calibrated against a Lambertian sphere).
+export const PAL = {
+  // (the overcast light is blue, B/R ~1.3: soil-brown albedos need R/B ~1.6-2 to still read brown, as real soils do)
+  // optically thick (clots, spray clusters, the dense base of a slide cloud): the bulk reflectance of the material
+  mud: [0.075, 0.05, 0.032],          // saturated brown forest soil / slide mud (wet loam: ~0.06-0.10)
+  slideBase: [0.16, 0.125, 0.088],    // base of a slide cloud: mud spray + water, dense, in the cloud's own shadow
+  slideTop: [0.37, 0.315, 0.245],     // its sky-lit crowns: brownish-grey fines (crushed gneiss + soil ~0.3)
+  // optically thin veils: colour ~ single-scattering albedo x the mean sky + ground light (water drops scatter almost
+  // everything, mud fines absorb): lighter than the wet ground below them, never as white as fog
+  soilMist: [0.245, 0.208, 0.162],     // fine mud + water droplets over a wet-soil impact: grey-brown
+  rockMist: [0.24, 0.222, 0.185],       // crushed granite / gneiss fines + spray off a wet road or rock: grey
+  gravelMist: [0.27, 0.245, 0.205],
+  frontBase: [0.2, 0.16, 0.115],      // mud-and-water mist churned off the debris front: dirty brown
+  water: [0.47, 0.48, 0.5],            // fine rain-water spray (refracts sky + ground light)
+};
+/** out = mix(a, b, t) * (1 +- jit) (slight per-puff tone variation) */
+export function palMix(out, a, b, t, jit = 0.08) {
+  const j = 1 + (Math.random() - 0.5) * 2 * jit, w = 1 + (Math.random() - 0.5) * jit * 0.5;
+  return out.setRGB(lerp(a[0], b[0], t) * j * w, lerp(a[1], b[1], t) * j, lerp(a[2], b[2], t) * j / w);
+}
