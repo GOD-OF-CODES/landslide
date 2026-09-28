@@ -3,6 +3,7 @@
 // player presses Start, the chosen preset is stored and the game boots with it.
 import { config, PARAMS, storedQuality } from './core/config.js';
 import { showQualityGate } from './ui/gate.js';
+import { isStaleChunkError, recoverFromStaleBuild, showFatal } from './core/recover.js';
 
 const mainModule = import('./main.js'); // starts downloading now; main.js does nothing until start() is called
 mainModule.catch(() => {});
@@ -17,12 +18,16 @@ async function run() {
     config.setQuality(key);
     try { sessionStorage.setItem('landslide.gateDone', '1'); } catch {}
   }
-  const main = await mainModule;
+  let main;
+  try { main = await mainModule; } catch (e) {
+    // stale deployment or dropped connection: one automatic reload (the quality choice is kept)
+    if (isStaleChunkError(e) && recoverFromStaleBuild(e)) return;
+    throw e;
+  }
   await main.start();
 }
 
 run().catch((e) => {
   console.error('[boot] fatal', e);
-  document.body.insertAdjacentHTML('beforeend', `<pre style="position:fixed;inset:20px;color:#f88;background:#000c;padding:20px;z-index:99999;white-space:pre-wrap">Fatal error: ${e?.stack || e}</pre>`);
-  window.__READY = true;
+  showFatal(e);
 });

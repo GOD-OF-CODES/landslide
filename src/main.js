@@ -6,6 +6,7 @@ import { Assets, setVariantTier, BASE } from './core/assets.js';
 import { RoadPath } from './core/road.js';
 import { Debug, flags } from './core/debug.js';
 import Physics from './physics/world.js';
+import { isStaleChunkError, recoverFromStaleBuild, showFatal } from './core/recover.js';
 
 // ---------------------------------------------------------------------------------------------
 // System registry. Each module default-exports a class: new X(ctx); optional async init();
@@ -110,6 +111,8 @@ async function boot() {
       if (sys.init) await sys.init();
       ctx.events.emit('boot:progress', { key, done: true });
     } catch (e) {
+      // a system chunk from an older deployment is gone: reload once to get the current build
+      if (isStaleChunkError(e) && recoverFromStaleBuild(e)) return;
       console.error(`[boot] system "${key}" failed to load/init:`, e);
       ctx.events.emit('boot:progress', { key, error: String(e) });
       delete ctx[key]; delete ctx.systems[key];
@@ -235,7 +238,7 @@ function forceRenderable(scene) {
 export function start() {
   return boot().catch((e) => {
     console.error('[boot] fatal', e);
-    document.body.insertAdjacentHTML('beforeend', `<pre style="position:fixed;inset:20px;color:#f88;background:#000c;padding:20px;z-index:99999;white-space:pre-wrap">Fatal error: ${e?.stack || e}</pre>`);
-    window.__READY = true;
+    if (isStaleChunkError(e) && recoverFromStaleBuild(e)) return;
+    showFatal(e);
   });
 }
