@@ -4,6 +4,11 @@
 import { config, PARAMS, storedQuality } from './core/config.js';
 import { showQualityGate } from './ui/gate.js';
 import { isStaleChunkError, recoverFromStaleBuild, showFatal } from './core/recover.js';
+import { platform, installIframeGuards } from './core/platform.js';
+
+// CrazyGames: iframe input guards and SDK init as early as possible (init never throws; standalone = 'disabled')
+installIframeGuards();
+platform.init();
 
 const mainModule = import('./main.js'); // starts downloading now; main.js does nothing until start() is called
 mainModule.catch(() => {});
@@ -18,6 +23,8 @@ async function run() {
     config.setQuality(key);
     try { sessionStorage.setItem('landslide.gateDone', '1'); } catch {}
   }
+  // the SDK must be initialised before the loading screen reports loadingStart; don't wait on a hung SDK forever
+  await Promise.race([platform.ready, new Promise((r) => setTimeout(r, 4000))]);
   let main;
   try { main = await mainModule; } catch (e) {
     // stale deployment or dropped connection: one automatic reload (the quality choice is kept)
