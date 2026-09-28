@@ -30,10 +30,13 @@ export const QUALITY_PRESETS = {
     treeMeshDistance: 55, impostorDistance: 1400, rain: 0.6, maxRocks: 50, anisotropy: 4,
     assetTier: 'mid', adaptiveRes: true, download: 39,
   },
+  // (LOWPOLISH) low: mesh trees out to 26 m (treeMeshDistance 52; was 35 -> 17.5 m). The low impostor atlas is half
+  // resolution (192 px frames), so a 25 m spruce 17.5 m away was a 2.4x magnified, painterly blob; LOD1 meshes to 26 m
+  // cost ~+0.15 ms on the M1. treeShadowDist keeps the shadow-casting LOD1 range where it was (~12 m).
   low: {
     name: 'Low', pixelRatio: 0.65, maxDpr: 1, shadowMapSize: 1024, shadowRadius: 40,
     ao: 'off', bloom: false, motionBlur: false, dof: false, grassDensity: 0.2, grassRadius: 28,
-    treeMeshDistance: 35, impostorDistance: 1000, rain: 0.4, maxRocks: 30, anisotropy: 2,
+    treeMeshDistance: 52, treeShadowDist: 12, impostorDistance: 1000, rain: 0.4, maxRocks: 30, anisotropy: 2,
     assetTier: 'lo', adaptiveRes: true, download: 26,
   },
 };

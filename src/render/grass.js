@@ -40,6 +40,27 @@ export function corridorVegetation(markers, s, d, ny) {
 /** Shared grass tuning (debug: ctx.vegetation.grass.tune). */
 export const GRASS_TUNE = { boost: { value: 1.4 } };
 
+// (LOWPOLISH) Back-face normals of the double-sided vegetation cards. three's normal_fragment_begin flips the normal of
+// a back face (normal *= faceDirection). The grass, fern and ground-flora cards carry bent "up" vertex normals (the
+// canopy normal, not the card's), so on every back face the flip points the normal into the ground: the grass-card
+// back faces then get no sky light (the black blobs on the verge) and the bilberry back faces reflect the sky at a
+// grazing Fresnel angle (bright white "crumpled paper" sprigs). The old `.replace('normal *= faceDirection;', '')` in
+// the grass materials acts on the unexpanded source (#include <normal_fragment_begin>) and so never did anything; this
+// expands the chunk without the flip. A real leaf / blade is lit from the sky on both sides (thin, translucent), which
+// is what the unflipped up-normal models. On by default on Low / Medium; ?vegfix enables it on any preset (?novegfix
+// disables it). Ultra / High keep their current shaders (the lead's pixel-identical rule for those presets).
+export function vegBackFix(ctx) {
+  const sp = new URLSearchParams(globalThis.location?.search || '');
+  if (sp.has('novegfix')) return false;
+  if (sp.has('vegfix')) return true;
+  const k = ctx?.config?.quality?.key;
+  return k === 'low' || k === 'medium';
+}
+export function noBackFlip(fragmentShader) {
+  const nb = THREE.ShaderChunk.normal_fragment_begin.replace('normal *= faceDirection;', '');
+  return fragmentShader.replace('#include <normal_fragment_begin>', nb);
+}
+
 const CH = 8;          // chunk size (m)
 const GRID = 9;        // ray grid per chunk (GRID x GRID)
 const STRIDE = 7;      // grass point: x, y, z, scale, rotY, rank, dryness
@@ -471,7 +492,7 @@ function buildBilberry(seed) {
 // ------------------------------------------------------------------------------------------------------------------
 // Grass material: vertex-coloured blades (x instance colour), wind bending + gust waves, distance shrink, rain wetness
 // ------------------------------------------------------------------------------------------------------------------
-function createGrassMaterial(radius) {
+function createGrassMaterial(radius, backFix = false) {
   // envMapIntensity < 1: thin blades with up-facing normals otherwise mirror the bright overcast sky at grazing angles
   // and the whole meadow turns silver-grey (grass occludes most of its own sky hemisphere)
   const m = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.8, metalness: 0, envMapIntensity: 0.45 });
@@ -520,13 +541,14 @@ function createGrassMaterial(radius) {
         roughnessFactor = mix(roughnessFactor, 0.5, uWet * 0.6);
       `)
       .replace('normal *= faceDirection;', '');
+    if (backFix) sh.fragmentShader = noBackFlip(sh.fragmentShader);
   };
-  m.customProgramCacheKey = () => 'grass-v4';
+  m.customProgramCacheKey = () => 'grass-v4' + (backFix ? 'n' : '');
   return m;
 }
 
 /** Grass-card material: atlas albedo (x instance dryness tint), alpha test with mip coverage keep, wind, wetness. */
-function createGrassCardMaterial(map, normalMap, radius) {
+function createGrassCardMaterial(map, normalMap, radius, backFix = false) {
   const m = new THREE.MeshStandardMaterial({
     map, normalMap: normalMap || null, normalScale: new THREE.Vector2(0.5, 0.5), side: THREE.DoubleSide, alphaTest: 0.4,
     roughness: 0.85, metalness: 0, envMapIntensity: 0.3,
@@ -584,8 +606,9 @@ function createGrassCardMaterial(map, normalMap, radius) {
       `)
       .replace('#include <aomap_fragment>', '#include <aomap_fragment>\n  reflectedLight.indirectSpecular *= 0.45;   // blades occlude most of their own sky: no silvery grazing sheet')
       .replace('normal *= faceDirection;', '');
+    if (backFix) sh.fragmentShader = noBackFlip(sh.fragmentShader);
   };
-  m.customProgramCacheKey = () => 'grass-card-v2';
+  m.customProgramCacheKey = () => 'grass-card-v2' + (backFix ? 'n' : '');
   return m;
 }
 
@@ -623,8 +646,9 @@ function createFloraMaterial(map, normalMap, radius, opts = {}) {
       .replace('#include <common>', '#include <common>\nuniform float uWet; uniform float uWetRough; varying float vFlAO;')
       .replace('#include <map_fragment>', '#include <map_fragment>\n  diffuseColor.rgb *= vFlAO * mix(1.0, 0.85, uWet);')
       .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  roughnessFactor = mix(roughnessFactor, uWetRough, uWet);');
+    if (opts.backFix) sh.fragmentShader = noBackFlip(sh.fragmentShader);
   };
-  m.customProgramCacheKey = () => 'flora-v1';
+  m.customProgramCacheKey = () => 'flora-v1' + (opts.backFix ? 'n' : '');
   return m;
 }
 
@@ -647,18 +671,20 @@ export class GrassField {
     this.tune = GRASS_TUNE;
     this.canopyAt = typeof opts.canopyAt === 'function' ? opts.canopyAt : null;
     if (ctx.flags?.nopost || (q.ao && q.ao === 'off')) GRASS_TUNE.boost.value = 1.15;
-    this.flowerMat = createGrassMaterial(Math.min(this.radius, 30));
+    const bf = this.backFix = vegBackFix(ctx);
+    this.lite = q.key === 'low' && !new URLSearchParams(globalThis.location?.search || '').has('lpoff');
+    this.flowerMat = createGrassMaterial(Math.min(this.radius, 30), bf);
     const dens = Math.max(0.3, this.density);
     if (opts.grassMap) {
       // crossed wild-grass cards (atlas rendered from 3D blades in tools/blender/trees.py): dense, mip-filtered, cheap
       this.cards = true;
-      this.mat = createGrassCardMaterial(opts.grassMap, opts.grassNormal, this.radius);
+      this.mat = createGrassCardMaterial(opts.grassMap, opts.grassNormal, this.radius, bf);
       this.nearDry = this._mkInst(buildCardClump(11, ['g_dry', 'g_straw', 'g_dry'], 3, 2), this.mat, Math.round(9000 * dens), 'grass_near_dry', true);
       this.nearGreen = this._mkInst(buildCardClump(17, ['g_green', 'g_mixed', 'g_green'], 3, 2), this.mat, Math.round(9000 * dens), 'grass_near_green', true);
       this.far = this._mkInst(buildCardClump(23, ['g_mixed', 'g_green'], 2, 1, 1.15), this.mat, Math.round(26000 * dens), 'grass_far', true);
     } else {
       // fallback: blade geometry (a drier tussock mix with seed stems and a greener, lower tuft mix)
-      this.mat = createGrassMaterial(this.radius);
+      this.mat = createGrassMaterial(this.radius, bf);
       this.nearDry = this._mkInst(buildClump(11, { blades: 13, segs: 4, widthMul: 1.2, straw: 0.55, stems: 3, lodge: 0.8 }), this.mat, Math.round(16000 * dens), 'grass_near_dry', true);
       this.nearGreen = this._mkInst(buildClump(17, { blades: 14, segs: 3, widthMul: 1.1, straw: 0.18, stems: 1, lodge: 0.6, tuft: true }), this.mat, Math.round(14000 * dens), 'grass_near_green', true);
       this.far = this._mkInst(buildClump(23, { blades: 5, segs: 2, widthMul: 2.1, straw: 0.4, stems: 1, lodge: 0.7, far: true }), this.mat, Math.round(30000 * dens), 'grass_far', true);
@@ -667,14 +693,14 @@ export class GrassField {
     this.ferns = null; this.bilberry = null; this.coltsfoot = null; this.butterbur = null; this.litter = null;
     if (opts.foliageMap) {
       const fm = createFoliageMaterial({ map: opts.foliageMap, normalMap: opts.foliageNormal,
-        lod: new THREE.Vector4(-2, -1, this.radius * 0.8, this.radius), alphaTest: 0.4 });
+        lod: new THREE.Vector4(-2, -1, this.radius * 0.8, this.radius), alphaTest: 0.4, groundFix: bf });
       fm.color.setRGB(0.62, 0.6, 0.5);   // wet late-season fern: darker, less lime than the card
       this.ferns = this._mkInst(buildFern(3), fm, 2500, 'ferns');
       this.ferns.castShadow = false;   // knee-high fern shadows are invisible under the soft overcast sun
       const R = this.floraRadius;
-      this.bilberry = this._mkInst(buildBilberry(31), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.65, color: new THREE.Color(0.8, 0.8, 0.75) }), 2600, 'bilberry');
-      this.coltsfoot = this._mkInst(buildForb(41, 'coltsfoot'), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.8, wetRough: 0.55, color: new THREE.Color(0.58, 0.6, 0.58) }), 900, 'coltsfoot');
-      this.butterbur = this._mkInst(buildForb(43, 'butterbur'), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.7, wetRough: 0.5, color: new THREE.Color(0.7, 0.74, 0.66) }), 400, 'butterbur');
+      this.bilberry = this._mkInst(buildBilberry(31), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.65, color: new THREE.Color(0.8, 0.8, 0.75), backFix: bf }), 2600, 'bilberry');
+      this.coltsfoot = this._mkInst(buildForb(41, 'coltsfoot'), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.8, wetRough: 0.55, color: new THREE.Color(0.58, 0.6, 0.58), backFix: bf }), 900, 'coltsfoot');
+      this.butterbur = this._mkInst(buildForb(43, 'butterbur'), createFloraMaterial(opts.foliageMap, opts.foliageNormal, R, { roughness: 0.7, wetRough: 0.5, color: new THREE.Color(0.7, 0.74, 0.66), backFix: bf }), 400, 'butterbur');
       const lm = createFloraMaterial(opts.foliageMap, opts.foliageNormal, Math.min(R, 30), { roughness: 0.85, wetRough: 0.55, alphaTest: 0.45,
         color: new THREE.Color(0.62, 0.62, 0.52) });
       lm.polygonOffset = true; lm.polygonOffsetFactor = -2; lm.polygonOffsetUnits = -2; lm.side = THREE.FrontSide;
@@ -941,15 +967,18 @@ export class GrassField {
         if (Math.hypot(dx, dz) > R + CH * 4) this.chunks.delete(k);
       }
     }
-    let budget = this._frame < 5 ? 40 : 4;
-    const t0 = performance.now();
-    while (this.pending.length && budget-- > 0 && performance.now() - t0 < 4) {
+    // (LOWPOLISH) Low: at most 2 chunks / 2 ms per frame (was 4 / 4 ms; a weak CPU spent much of its frame here while
+    // driving). The pending list is sorted nearest first, so only the outer ring of the 28 m radius waits a frame longer.
+    const lite = this.lite;
+    let budget = this._frame < 5 ? 40 : (lite ? 2 : 4);
+    const t0 = performance.now(), tMax = this._frame < 5 ? 4 : (lite ? 2 : 4);
+    while (this.pending.length && budget-- > 0 && performance.now() - t0 < tMax) {
       const [, k, gx, gz] = this.pending.shift();
       if (this.chunks.has(k)) continue;
       this.chunks.set(k, this._genChunk(k, gx, gz));
       this._dirty = true;
     }
-    if (this._dirty && (this._frame % 3 === 0 || !this.pending.length)) {
+    if (this._dirty && (this._frame % (this.lite ? 4 : 3) === 0 || !this.pending.length)) {
       this._dirty = false;
       this._rebuild(cp);
     }

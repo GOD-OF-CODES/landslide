@@ -10,6 +10,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import sharp from 'sharp';
+import { NodeIO } from '@gltf-transform/core';
+import { ALL_EXTENSIONS, EXTMeshoptCompression } from '@gltf-transform/extensions';
+import { MeshoptDecoder, MeshoptEncoder } from 'meshoptimizer';
 
 const PUB = path.resolve('public/assets');
 const OUT = path.join(PUB, 'q');
@@ -65,17 +68,44 @@ async function images(relList) {
 // Assets whose texture detail matters too much to shrink on low (the conifer needle atlas turns blotchy at 512)
 const KEEP_FULL = { lo: new Set(['models/trees.glb']), mid: new Set() };
 
+// `gltf-transform resize` decodes EXT_meshopt_compression and writes the geometry uncompressed (car.glb: +2 MB), which
+// ate most of the texture saving and left hands.glb without a variant. Re-encode it with meshopt WITHOUT quantization:
+// lossless, every vertex attribute stays bit-identical to the original (QA-checked on car/hands), only smaller.
+let _io = null;
+async function gltfIO() {
+  if (!_io) {
+    await MeshoptDecoder.ready; await MeshoptEncoder.ready;
+    _io = new NodeIO().registerExtensions(ALL_EXTENSIONS).registerDependencies({ 'meshopt.decoder': MeshoptDecoder, 'meshopt.encoder': MeshoptEncoder });
+  }
+  return _io;
+}
+async function recompress(file) {
+  const io = await gltfIO(), doc = await io.read(file);
+  doc.createExtension(EXTMeshoptCompression).setRequired(true)
+    .setEncoderOptions({ method: EXTMeshoptCompression.EncoderMethod.QUANTIZE }); // no quantize() pass: no filters
+  await io.write(file, doc);
+}
+/** Largest texture edge in a GLB (px). */
+async function maxTextureSize(file) {
+  const doc = await (await gltfIO()).read(file);
+  return Math.max(0, ...doc.getRoot().listTextures().map((t) => Math.max(...(t.getSize() || [0, 0]))));
+}
+
 async function models(relList) {
   for (const rel of relList) {
     const src = path.join(PUB, rel);
     try { await fs.access(src); } catch { continue; }
+    const maxTex = await maxTextureSize(src);
     for (const [tier, size] of Object.entries(TIERS)) {
       if (KEEP_FULL[tier]?.has(rel)) continue;
+      // nothing to shrink: no variant (resize would still re-encode every image lossily at the same size)
+      if (maxTex <= size) continue;
       const outRel = `q/${tier}/${rel}`;
       const out = path.join(PUB, outRel);
       await fs.mkdir(path.dirname(out), { recursive: true });
-      // resize only shrinks textures larger than the limit; geometry is untouched
+      // resize only shrinks textures larger than the limit; the geometry is re-encoded losslessly (see recompress)
       execFileSync('npx', ['gltf-transform', 'resize', src, out, '--width', String(size), '--height', String(size)], { stdio: 'pipe' });
+      await recompress(out);
       const [a, b] = [(await fs.stat(src)).size, (await fs.stat(out)).size];
       if (b >= a * 0.97) { await fs.rm(out); continue; } // no gain (no big textures inside)
       add(rel, tier, outRel);
@@ -88,9 +118,15 @@ async function hdr() {
   const rel = 'sky/env_2k.hdr';
   const outRel = 'q/lo/sky/env_1k.hdr';
   const out = path.join(PUB, outRel);
+  // cached in raw_assets/ (git-ignored) so a re-run does not need the network (the q/ folder is wiped above)
+  const cache = path.resolve('raw_assets/hdri/overcast_soil_puresky_1k.hdr');
   try { await fs.access(out); } catch {
-    const f = await (await fetch('https://api.polyhaven.com/files/overcast_soil_puresky')).json();
-    const buf = Buffer.from(await (await fetch(f.hdri['1k'].hdr.url)).arrayBuffer());
+    let buf;
+    try { buf = await fs.readFile(cache); } catch {
+      const f = await (await fetch('https://api.polyhaven.com/files/overcast_soil_puresky')).json();
+      buf = Buffer.from(await (await fetch(f.hdri['1k'].hdr.url)).arrayBuffer());
+      try { await fs.mkdir(path.dirname(cache), { recursive: true }); await fs.writeFile(cache, buf); } catch { /* optional cache */ }
+    }
     await fs.mkdir(path.dirname(out), { recursive: true });
     await fs.writeFile(out, buf);
   }
@@ -101,7 +137,7 @@ async function hdr() {
 await fs.rm(OUT, { recursive: true, force: true });
 await textures();
 await images(['models/impostors/albedo.webp', 'models/impostors/normal.webp', 'sky/sky_4k.jpg']);
-await models(['models/trees.glb', 'models/props.glb', 'models/car.glb', 'models/rocks.glb']);
+await models(['models/trees.glb', 'models/props.glb', 'models/car.glb', 'models/rocks.glb', 'models/hands.glb']);
 await hdr();
 await fs.writeFile(path.join(OUT, 'variants.json'), JSON.stringify(manifest));
 

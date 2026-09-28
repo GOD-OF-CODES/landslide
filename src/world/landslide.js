@@ -388,6 +388,25 @@ export default class Landslide {
     this.maxRocks = ctx.config?.quality?.maxRocks ?? 60;
     // set-piece dust through the particle pools: Ultra/High keep every puff, Medium/Low thin them out
     this.fxQ = { ultra: 1, high: 1, medium: 0.5, low: 0.3 }[ctx.config?.quality?.key] ?? 1;
+    // (LOWPOLISH) CPU on weak laptops: small stones (spray, fragments, the small end of the gully torrent) are mostly set
+    // dressing (never aimed; a 0.3 m stone would need > 35 m/s relative speed to reach the car's hazard energy). On
+    // Low / Medium the ones below liteR fly as cheap bodies: a box collider instead of the 48-vertex hull and no
+    // rock-rock / rock-debris contact pairs (the bulk of the narrow phase in a torrent or a pile), and they settle
+    // sooner. They still hit the ground, the car, the player and the guardrails exactly as before (same lethality),
+    // so nothing passes through the car and the hazards are unchanged. Same spawn schedule and seeded random stream.
+    const qk = new URLSearchParams(globalThis.location?.search || '').has('lpoff') ? 'off' : ctx.config?.quality?.key;   // ?lpoff: A/B
+    this.liteR = { medium: 0.2, low: 0.3 }[qk] ?? 0;
+    // (LOWPOLISH) the debris-front surface (~6.7k vertices, several noise octaves each) is rebuilt at most every Nth
+    // frame while none of it is inside the camera frustum (the chase keeps it behind the car: only the mirrors and
+    // the chase camera see it). Low / Medium only; 1 = always as before.
+    this.frontOffEvery = { medium: 3, low: 4 }[qk] ?? 1;
+    // Low: coarser front grid (fewer rows) and without the two finest churn octaves (a few cm of relief, sub-pixel at
+    // the Low render resolution)
+    this.frontLite = qk === 'low';
+    // Low / Medium: continuous collision detection only while a rock moves more than half its radius per step (the
+    // only case where it could tunnel through the thin terrain triangles; CCD was ~30 % of the physics step), and rocks
+    // left more than 45 m behind the camera settle (become debris / are dropped) instead of rolling on unseen
+    this.physLite = qk === 'low' || qk === 'medium';
     this._groundRows = new Map();
     this._frontDirty = true;
     this._visS = 0;
@@ -418,6 +437,8 @@ export default class Landslide {
     }
     // debug helpers
     if (ctx.flags?.debug) window.__slide = this;
+    // tree-snap candidates now, behind the loading screen (vegetation is initialised before us)
+    try { const f = ctx.vegetation?.trees; if (f?.data && f.count) this._snapCandidates(f); } catch { /* built lazily */ }
   }
 
   async _buildRockAssets(gltf) {
@@ -566,22 +587,27 @@ export default class Landslide {
     }
     bd.setAngvel(av);
     if (radius < 0.5) bd.setDominanceGroup(-1);   // the car shoves small stones aside instead of hanging up on them
+    const lite = radius < this.liteR && !opts.full;
+    if (lite) bd.setAngularDamping(0.9);   // box tumbles, but a little more rolling loss than the faceted hull
     const body = world.createRigidBody(bd);
     let cd = null;
-    if (V.hull) {
+    if (lite) {
+      cd = R.ColliderDesc.cuboid(radius * 0.72, radius * 0.58, radius * 0.66);
+    } else if (V.hull) {
       const pts = new Float32Array(V.hull.length);
       for (let i = 0; i < pts.length; i++) pts[i] = V.hull[i] * radius;
       cd = R.ColliderDesc.convexHull(pts);
     }
     if (!cd) cd = R.ColliderDesc.ball(radius * 0.8);
     cd.setDensity(DENSITY).setFriction(0.9).setRestitution(opts.restitution ?? (0.16 + this.rng() * 0.12))
-      .setCollisionGroups(groups(G.ROCK, G.STATIC | G.CAR | G.PLAYER | G.ROCK | G.DEBRIS | (radius >= 0.55 ? 0 : G.PROP))); // big boulders flatten the guardrail and go over
+      .setCollisionGroups(lite ? groups(G.ROCK, G.STATIC | G.CAR | G.PLAYER | G.PROP)
+        : groups(G.ROCK, G.STATIC | G.CAR | G.PLAYER | G.ROCK | G.DEBRIS | (radius >= 0.55 ? 0 : G.PROP))); // big boulders flatten the guardrail and go over
     const collider = world.createCollider(cd, body);
     const rock = {
       body, collider, variant: vi % this.variants.length, r: radius, mass: body.mass() || DENSITY * V.vol * radius ** 3,
       pos: new THREE.Vector3(pos.x, pos.y, pos.z), quat: rot.clone(), prevV: new THREE.Vector3(vel?.x || 0, vel?.y || 0, vel?.z || 0),
       still: 0, cool: 0.1, age: 0, mud: opts.mud ?? (0.3 + this.rng() * 0.6), lethal: opts.lethal !== false, hits: 0,
-      tag: opts.tag || null, scaleY: 1,
+      tag: opts.tag || null, scaleY: 1, lite,
     };
     rock.mudP = packMud(rock.mud, this.rng());   // instance attribute value: coat amount + per-rock seed
     this.rocks.push(rock);
@@ -625,7 +651,8 @@ export default class Landslide {
         .setFriction(0.9).setCollisionGroups(groups(G.ROCK, G.ALL & ~G.SENSOR));
       collider = phys.world.createCollider(cd);
     }
-    this.debris.push({ variant: rock.variant, matrix: m, collider, mud: rock.mud, mudP: rock.mudP, pos: rock.pos.clone(), r: rock.r });
+    // road frame of the (static) debris, cached for the swallowed-by-the-front test in _updateRockVisuals
+    this.debris.push({ variant: rock.variant, matrix: m, collider, mud: rock.mud, mudP: rock.mudP, pos: rock.pos.clone(), r: rock.r, s: pr?.s, d: pr?.d });
     this._debrisDirty = true;
   }
 
@@ -1013,8 +1040,10 @@ export default class Landslide {
     const { ctx } = this;
     // rows: dense at the snout, sparse far behind
     const us = [];
-    let u = FRONT_SNOUT, step = 0.28;
-    while (u > -FRONT_BACK) { us.push(u); u -= step; step = Math.min(2.2, step * 1.045); }
+    // (LOWPOLISH) Low: ~35 % fewer rows (0.4 m at the snout instead of 0.28 m), the surface is rebuilt on the CPU
+    const lo = this.frontLite;
+    let u = FRONT_SNOUT, step = lo ? 0.4 : 0.28;
+    while (u > -FRONT_BACK) { us.push(u); u -= step; step = Math.min(lo ? 2.6 : 2.2, step * (lo ? 1.055 : 1.045)); }
     us.push(-FRONT_BACK);
     this._us = Float32Array.from(us);
     const NS = us.length, ND = FRONT_ND;
@@ -1265,6 +1294,22 @@ export default class Landslide {
     this._H = (FRONT_H + Math.min(this.frontSpeed, 10) * 0.22) * this._grow;
   }
 
+  /** Is any part of the front mass (snout to FRONT_BACK behind it) inside the camera frustum? (last frame's camera) */
+  _frontInView() {
+    const { ctx } = this;
+    const cam = ctx.camera, road = ctx.road;
+    const fr = this._frFront || (this._frFront = new THREE.Frustum());
+    fr.setFromProjectionMatrix(_m.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
+    const sph = this._frSph || (this._frSph = new THREE.Sphere());
+    for (const u of [FRONT_SNOUT, -8, -30, -60, -95, -130, -FRONT_BACK]) {
+      road.worldAt(Math.max(0.5, this._visS + u), -1, sph.center);
+      sph.center.y += 2;
+      sph.radius = 17;
+      if (fr.intersectsSphere(sph)) return true;
+    }
+    return false;
+  }
+
   /** Debris-mass surface height (world y) at (s, d) (column di), given the ground height g. */
   _surf(s, d, di, u, roadY, g, T) {
     const H = this._H;
@@ -1276,7 +1321,7 @@ export default class Landslide {
     let uj = u;
     if (u > -4) {
       const C = this._churnT;
-      uj += (vnoise3(d * 0.55 + 1.3, C * 0.7, s * 0.45) * 0.8 + vnoise3(d * 1.5, C * 1.5 + 4.1, s * 1.4) * 0.45 + vnoise3(d * 3.7, C * 2.3, s * 3.1 + 2) * 0.16) * smooth(-4, -0.5, u);
+      uj += (vnoise3(d * 0.55 + 1.3, C * 0.7, s * 0.45) * 0.8 + vnoise3(d * 1.5, C * 1.5 + 4.1, s * 1.4) * 0.45 + (this.frontLite ? 0 : vnoise3(d * 3.7, C * 2.3, s * 3.1 + 2) * 0.16)) * smooth(-4, -0.5, u);
     }
     if (uj > 0) { const x = Math.min(uj / lobe, 1); A = Math.pow(Math.max(0, 1 - x * x), 0.6); }
     else A = lerp(1, 0.52, smooth(-4, -40, uj));   // thick bouldery snout, thinner slurry body (~2 m) behind
@@ -1285,7 +1330,7 @@ export default class Landslide {
     let n = this._topoAt(this._topo, di, sm) + vnoise3(sm * 0.55, d * 0.6, T * 0.25) * 0.32;
     if (u > -8) {
       const snoutZone = smooth(-8, 0, u);
-      n += (vnoise3(sm * 1.1, d * 0.9, T * 1.6) * 0.5 + vnoise3(sm * 2.3, d * 2.1, T * 2.2) * 0.18) * snoutZone;
+      n += (vnoise3(sm * 1.1, d * 0.9, T * 1.6) * 0.5 + (this.frontLite ? 0 : vnoise3(sm * 2.3, d * 2.1, T * 2.2) * 0.18)) * snoutZone;
     }
     const cross = 0.72 + 0.34 * smooth(-4, 7, d);
     let level = roadY + (H * cross + n * (H / FRONT_H)) * A;
@@ -1345,7 +1390,8 @@ export default class Landslide {
     if (!mesh.visible) { this._hideFrontExtras(); return; }
     // throttle: far away and slow -> update less often
     this._frontTick = (this._frontTick || 0) + 1;
-    const every = Math.abs(dist) > 250 ? 6 : (this.frontSpeed < 0.05 && Math.abs(dist) > 60 ? 3 : (Math.abs(dist) > 32 ? 2 : 1)); // the chase keeps it ~45 m back: every other frame there
+    let every = Math.abs(dist) > 250 ? 6 : (this.frontSpeed < 0.05 && Math.abs(dist) > 60 ? 3 : (Math.abs(dist) > 32 ? 2 : 1)); // the chase keeps it ~45 m back: every other frame there
+    if (every < this.frontOffEvery && !this._frontInView()) every = this.frontOffEvery;
     if (this._frontTick % every !== 0 && !this._frontDirty) {
       // skipped frame: the front's distant-LOD rocks are re-pushed from last frame's record (the LOD mesh is rebuilt
       // every frame), everything else keeps its instances
@@ -1670,6 +1716,15 @@ export default class Landslide {
     if (D && typeof D.emit === 'function') {
       // Medium / Low: fewer puffs (Math.random, not this.rng: the seeded stream drives the rocks and must not differ by preset)
       if (this.fxQ < 1 && Math.random() > this.fxQ) return true;
+      // (LOWPOLISH) ...and each kept puff stands in for the dropped ones: a little larger and denser, so the cloud keeps
+      // most of its optical depth (the Low rockfall read as a clean slide with almost no dust). A set of 1/q puffs of
+      // opacity a transmits (1-a)^(1/q); the kept one gets part of that (the square root: fewer, denser puffs would read
+      // as separate balls) and ~15-20 % more size, so the overdraw stays at ~40 % (Low) / ~65 % (Medium) of High's.
+      if (this.fxQ < 1) {
+        const k = 1 / Math.sqrt(this.fxQ);
+        op = Math.min(0.62, 1 - Math.pow(1 - op, k));
+        s1 *= Math.pow(k, 0.35); s0 *= Math.pow(k, 0.2);
+      }
       D.emit(p, vel, life, s0, s1, op, col, ground, buoy, 1, aspect, drag, soft);
       return true;
     }
@@ -1760,6 +1815,13 @@ export default class Landslide {
       } else this.wallBody.setNextKinematicTranslation({ x: 0, y: -500, z: 0 });
     }
     if (!this.rocks.length) return;
+    let camS = null, frF = null;
+    if (this.physLite && ctx.road) {
+      camS = ctx.road.project(ctx.camera.position, this._prCamF || (this._prCamF = {})).s;
+      frF = this._frFix || (this._frFix = new THREE.Frustum());
+      const cam = ctx.camera;
+      frF.setFromProjectionMatrix(_m.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
+    }
     const car = ctx.car, cb = car?.body;
     let cp = null, cq = null, cv = null;
     if (cb) { const t = cb.translation(), r = cb.rotation(), v = cb.linvel(); cp = _cp.set(t.x, t.y, t.z); cq = _cq.set(r.x, r.y, r.z, r.w).invert(); cv = _cv.set(v.x, v.y, v.z); }
@@ -1810,10 +1872,17 @@ export default class Landslide {
         const dd = Math.hypot(t.x - pl.feet.x, t.y - cy, t.z - pl.feet.z);
         if (dd < R.r * 0.8 + 0.3) { const e = 0.5 * R.mass * sp * sp / 1e5; if (e > 0.012) this._hazard('player', 'boulder', e); }
       }
+      if (this.physLite) {
+        const ccd = sp * h > 0.5 * R.r;
+        if (ccd !== R.ccd) { R.ccd = ccd; b.enableCcd(ccd); }
+      }
       // settle / cull
       if (sp < 0.25 || b.isSleeping()) R.still += h; else R.still = 0;
       const pr = ctx.road?.project(R.pos, R._pr || (R._pr = {}));
-      if (pr && (pr.dy < -60 || (this.frontS > 0 && pr.s < this._visS - 2 && Math.abs(pr.d) < 9 && t.y < (this.surfaceY(pr.s, pr.d) ?? -1e9) + R.r * 0.2))) { this._retire(R, false); continue; }
+      if (pr && (pr.dy < -60 || (this.frontS > 0 && pr.s < this._visS - 2 && Math.abs(pr.d) < 9 && t.y < (this.surfaceY(pr.s, pr.d) ?? -1e9) + R.r * 0.2))) {
+        if (pr.dy < -60) { const gy = this._groundY(t.x, t.z, t.y + 200); if (gy != null && t.y < gy - R.r * 2) this._tunnelled = (this._tunnelled || 0) + 1; }   // diagnostics: fell through the ground
+        this._retire(R, false); continue;
+      }
       // timed rocks keep their promise after landing: an 'ahead' rock may not roll back down the road toward the car,
       // a 'behind' one may not chase it (only the along-road component is limited; the roll across is untouched)
       if (R.plan && R.age > R.plan.T * 0.8 && pr && Math.abs(pr.d) < 6) {
@@ -1827,10 +1896,23 @@ export default class Landslide {
         R.nudgeT = R.age;
         if (this._clearLane(R, pr)) continue;
       }
-      if (R.still > 1.0 || R.age > 40) {
+      // (Low / Medium) far behind the camera, out of view and not a timed rock: let it settle where it is once it is
+      // on the ground (checked a few times a second; a rock in mid-bounce carries on, so nothing is left hanging in
+      // the air for a later look back)
+      if (camS !== null && pr && !R.plan && R.age > 3 && pr.s < camS - 45 && (R._bhT = (R._bhT ?? 0) - h) <= 0) {
+        R._bhT = 0.2;
+        const sph = this._sphF || (this._sphF = new THREE.Sphere());
+        sph.center.copy(R.pos); sph.radius = R.r + 1;
+        if (!frF.intersectsSphere(sph)) {
+          const gy = this._groundY(t.x, t.z, t.y + 0.5);
+          if (gy != null && t.y - gy < R.r * 1.5) { R.behind = true; R.still = Math.max(R.still, 1.01); }
+        }
+      }
+      if (R.still > (R.lite ? 0.5 : 1.0) || R.age > (R.lite ? 14 : 40)) {
         const keep = pr && pr.dy > -25 && Math.abs(pr.d) < 30;
         // a boulder must never plug the lane for good: it keeps rolling off the nearest edge (or breaks up)
-        if (keep && R.age <= 40 && this._blocksLane(R, pr) && this._clearLane(R, pr)) continue;
+        // (a rock settled because it is far behind the camera goes straight to debris: no lane-clearing nudges there)
+        if (keep && R.age <= 40 && !R.behind && this._blocksLane(R, pr) && this._clearLane(R, pr)) continue;
         this._retire(R, keep);
       }
     }
@@ -1840,7 +1922,9 @@ export default class Landslide {
     const { ctx } = this;
     this.t += dt;
     // scheduled actions
-    if (this.queue.length) {
+    let anyDue = false;
+    for (let i = 0; i < this.queue.length; i++) if (this.queue[i].t <= this.t) { anyDue = true; break; }   // (no per-frame array while waiting)
+    if (anyDue) {
       const due = this.queue.filter((a) => a.t <= this.t);
       if (due.length) {
         this.queue = this.queue.filter((a) => a.t > this.t);
@@ -1848,6 +1932,12 @@ export default class Landslide {
       }
     }
     if (this.escape && dt > 0) this._updateEscape(dt);
+    // (LOWPOLISH) warm the ground-height rows under the intro pile (s 0..165) a few per frame while the front does not
+    // exist yet: the first front frame otherwise cast ~9k rays at once (a 100+ ms hitch at 4x CPU throttling in the
+    // middle of the rockfall). Same rows, same values (the static world does not change there), just computed earlier.
+    if (!(this.frontS > 0) && this._ds && (this._warmRow ?? 0) <= 165) {
+      for (let k = 0; k < 3 && (this._warmRow ?? 0) <= 165; k++) this._groundRow(this._warmRow = (this._warmRow ?? -1) + 1);
+    }
     if (this.loMesh) instReset(this.loMesh);
     this._updateFront(dt);
     this._updatePlume(dt);
@@ -1959,6 +2049,48 @@ export default class Landslide {
     }
   }
 
+  /** Trees that can stand in the flow's path: {i, s} (ascending i) for the trees within SNAP_R m of a road sample whose
+   *  road frame passes the snap test (cached; computed behind the loading screen). */
+  _snapCandidates(f) {
+    if (this._snapCand && this._snapCand.n === f.count) return this._snapCand.list;
+    const road = this.ctx.road, P = road.p, n = road.count;
+    const CS = 16, SNAP_R = 16, R2 = SNAP_R * SNAP_R;
+    const grid = new Map();
+    const key = (cx, cz) => (cx + 4096) * 8192 + (cz + 4096);
+    for (let i = 0; i < n; i++) {
+      const k = key(Math.floor(P[i * 3] / CS), Math.floor(P[i * 3 + 2] / CS));
+      let a = grid.get(k);
+      if (!a) grid.set(k, (a = []));
+      a.push(P[i * 3], P[i * 3 + 2]);
+    }
+    const out = [];
+    const D = f.data, pr = {};
+    for (let i = 0; i < f.count; i++) {
+      const x = D[i * 6], z = D[i * 6 + 2];
+      if (x < 60 || x > 1250) continue;
+      const cx = Math.floor(x / CS), cz = Math.floor(z / CS);
+      let hit = false;
+      for (let gx = cx - 1; gx <= cx + 1 && !hit; gx++) {
+        for (let gz = cz - 1; gz <= cz + 1 && !hit; gz++) {
+          const a = grid.get(key(gx, gz));
+          if (!a) continue;
+          for (let j = 0; j < a.length; j += 2) {
+            const dx = x - a[j], dz = z - a[j + 1];
+            if (dx * dx + dz * dz < R2) { hit = true; break; }
+          }
+        }
+      }
+      if (!hit) continue;
+      // the exact projection the snap list used to make per tree (global scan, no hint); trees never move
+      _p.set(x, D[i * 6 + 1], z);
+      pr._hint = -1e6;
+      road.project(_p, pr);
+      if (pr.d > FRONT_D0 + 1 && pr.d < FRONT_D1 - 1.5 && pr.dy < 6 && pr.dy > -12 && pr.s > 120 && pr.s < 1150) out.push({ i, s: pr.s });
+    }
+    this._snapCand = { n: f.count, list: out };
+    return out;
+  }
+
   /** Trees standing in the path of the flow snap as the snout reaches them ('tree:snap' {position}); the instance is
    *  removed from the forest (the flow carries its own uprooted trunks). Built lazily from vegetation.trees. */
   _updateTreeSnaps() {
@@ -1970,14 +2102,17 @@ export default class Landslide {
       const list = [];
       const pr = {};
       const tmp = new THREE.Vector3();
-      for (let i = 0; i < f.count; i++) {
+      // (LOWPOLISH) only trees within ~16 m of the road can pass the |d| test below: a road-sample grid rules the other
+      // ~95 % out without a global road.project() scan each (that loop was a 260 ms hitch at 4x CPU throttling the
+      // moment the intro pile appeared). The survivors are projected exactly as before, so the list is identical.
+      const cand = this._snapCandidates(f);
+      for (let c = 0; c < cand.length; c++) {
+        const i = cand[c].i;
         const o = i * 6;
         if (!(f.data[o + 3] > 0)) continue;
         tmp.set(f.data[o], f.data[o + 1], f.data[o + 2]);
         if (tmp.x < 60 || tmp.x > 1250) continue;
-        pr._hint = -1e6;
-        ctx.road.project(tmp, pr);
-        if (pr.d > FRONT_D0 + 1 && pr.d < FRONT_D1 - 1.5 && pr.dy < 6 && pr.dy > -12 && pr.s > 120 && pr.s < 1150) list.push({ s: pr.s, pos: tmp.clone() });
+        list.push({ s: cand[c].s, pos: tmp.clone() });
       }
       list.sort((a, b) => a.s - b.s);
       this._snapTrees = list;
@@ -2046,7 +2181,9 @@ export default class Landslide {
     if (this.frontS > 0 && this.debris.length && this.ctx.road) {
       for (let i = this.debris.length - 1; i >= 0; i--) {
         const D = this.debris[i];
-        const pr = this.ctx.road.project(D.pos, this._pr);
+        // (LOWPOLISH) settled debris never moves: its road frame is cached (the shared projection hint jumped between
+        // debris tens of metres apart and fell back to a full road scan for most of them, every frame)
+        const pr = D.s !== undefined ? D : this.ctx.road.project(D.pos, this._pr);
         if (pr.s < this._visS + 1 && Math.abs(pr.d) < 9) {
           const y = this.surfaceY(pr.s, pr.d);
           if (y != null && D.pos.y + D.r * 0.3 < y) this._removeDebrisAt(i);

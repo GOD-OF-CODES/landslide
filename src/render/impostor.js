@@ -318,6 +318,10 @@ function glslTranslucency(mask, shell) {
  */
 export function createFoliageMaterial(opts) {
   const cut = opts.alphaTest ?? 0.42, fringe = !!opts.fringe, fringeFade = fringe && !!opts.fringeFade;
+  // (LOWPOLISH) opts.groundFix: really keep the bent normal on back faces (see below). The ground ferns of grass.js
+  // pass it on Low / Medium (grass.js vegBackFix). opts.backFix (the fallen-tree sprays) stays the no-op it always was,
+  // so the fallen tree keeps its current look on every preset.
+  const backFix = !!opts.groundFix;
   const m = new THREE.MeshStandardMaterial({
     map: opts.map, normalMap: opts.normalMap || null, side: THREE.DoubleSide,
     alphaTest: cut, roughness: 0.8, metalness: 0.0,
@@ -398,8 +402,10 @@ export function createFoliageMaterial(opts) {
       `)
       // foliage: never flip the (bent) normal on back faces
       .replace('normal *= faceDirection;', '');
+    // (LOWPOLISH) the replace above acts on the unexpanded source and does nothing; opts.groundFix really drops the flip
+    if (backFix) sh.fragmentShader = sh.fragmentShader.replace('#include <normal_fragment_begin>', THREE.ShaderChunk.normal_fragment_begin.replace('normal *= faceDirection;', ''));
   };
-  m.customProgramCacheKey = () => 'tree-foliage-v17' + (fringe ? 'f' + cut + (fringeFade ? 'h' : '') : '');
+  m.customProgramCacheKey = () => 'tree-foliage-v17' + (fringe ? 'f' + cut + (fringeFade ? 'h' : '') : '') + (backFix ? 'n' : '');
   return m;
 }
 
@@ -468,7 +474,31 @@ export function createTreeDepthMaterial(map, alphaTest = 0.42) {
 // ------------------------------------------------------------------------------------------------------------------
 // Impostor material: view-aligned billboard, 4-frame blend (2 azimuths x 2 elevations), normal-atlas relighting
 // ------------------------------------------------------------------------------------------------------------------
-function createImpostorMaterial(meta, albedo, normal, base = null) {
+// (LOWPOLISH) Magnified-impostor detail (Low / Medium). Their atlases are 1/2 and 3/4 resolution, and on Low the
+// nearest impostors (26 m) show each atlas texel over ~1.6 px: bilinear magnification turns the needle sprays into
+// smooth, painterly blobs with rounded cut-out edges. Where a texel covers more than ~1 px, sub-texel value noise
+// (locked to the tree's atlas frame, so it does not crawl) breaks the coverage edge into ragged needle clumps and adds
+// clump-scale light/dark variation, fading out where the atlas is minified (no change there).
+const GLSL_IMP_DETAIL = /* glsl */`
+        {
+          vec2 tr_ts = vec2(textureSize(uAtlas, 0));
+          vec2 tr_tp = vUvA.xy * tr_ts;
+          vec2 tr_fw = fwidth(tr_tp);
+          float tr_mag = 1.0 / max(max(tr_fw.x, tr_fw.y), 1e-4);          // screen pixels per atlas texel
+          // cells >= ~1.3 px wherever the detail shows (finer noise would alias into shimmer while driving)
+          float tr_dw = smoothstep(1.2, 2.4, tr_mag);
+          if (tr_dw > 0.0) {
+            vec3 tr_dq = vec3(tr_tp * 1.1, vTint * 37.0);
+            float tr_d1 = tr_vn(tr_dq);
+            float tr_o2 = smoothstep(3.0, 5.0, tr_mag);        // a finer octave only where a texel spans >= 3 px
+            if (tr_o2 > 0.0) tr_d1 = mix(tr_d1, tr_d1 * 0.6 + tr_vn(tr_dq * 2.1 + 3.7) * 0.4, tr_o2);
+            // ragged coverage edge: only the partially covered texels move (the dense crown core keeps alpha ~1)
+            diffuseColor.a += (tr_d1 - 0.5) * 0.7 * tr_dw * smoothstep(0.02, 0.25, ia.a) * (1.0 - smoothstep(0.55, 0.95, ia.a));
+            // needle-clump shading: lit tips / dark gaps a few cm across
+            diffuseColor.rgb *= 1.0 + (tr_d1 - 0.5) * 0.55 * tr_dw;
+          }
+        }`;
+function createImpostorMaterial(meta, albedo, normal, base = null, detail = false) {
   const fringe = !!base;
   // alphaTest 0.22: the baked frames hold fractional sub-texel coverage; cutting at 0.5 left the crowns sparser and more
   // tiered than the (mip-filtered) mesh LODs they replace (crown pixel coverage matched with scratch/trees/lodmatch.mjs)
@@ -580,7 +610,7 @@ function createImpostorMaterial(meta, albedo, normal, base = null) {
                 + texture2D(uAtlas, vUvB.xy) * vW.z + texture2D(uAtlas, vUvB.zw) * vW.w;
         // (distance thinning: the atlas carries a coverage-preserving mip chain, see applyCoverageMips)
         diffuseColor.rgb = ia.rgb;
-        diffuseColor.a = ia.a * uImpGain;
+        diffuseColor.a = ia.a * uImpGain;${detail ? GLSL_IMP_DETAIL : ''}
         // per-tree hue/brightness variation (same formula as the mesh LODs' instanceColor)
         vec3 tint = tr_treeTint(vTint);
         diffuseColor.rgb *= mix(vec3(1.0), tint, uTintAmt) * uFolTint * uImpBright;
@@ -615,7 +645,7 @@ function createImpostorMaterial(meta, albedo, normal, base = null) {
       .replace('#include <dithering_fragment>', `#include <dithering_fragment>
         if (uImpDebug == 1) gl_FragColor = vec4(diffuseColor.rgb * 4.0, 1.0);`);
   };
-  m.customProgramCacheKey = () => 'tree-impostor-v10' + (fringe ? 'f' : '');
+  m.customProgramCacheKey = () => 'tree-impostor-v10' + (fringe ? 'f' : '') + (detail ? 'd' : '');
   return m;
 }
 
@@ -882,7 +912,8 @@ export class TreeField {
     const q = ctx.config?.quality || {};
     // Mesh trees end at 0.6 x treeMeshDistance (48 m on 'high'): beyond that a 25 m spruce is < 260 px tall and the
     // 384 px impostor frames are indistinguishable from the 4k-triangle LOD1, which cost ~350k triangles/pass there.
-    const tmd = q.treeMeshDistance ?? 80;
+    const sp = new URLSearchParams(globalThis.location?.search || '');   // debug flags (read once)
+    const tmd = +sp.get('tmd') || (q.treeMeshDistance ?? 80);   // debug: ?tmd=<m> overrides the preset
     // 0.5 x treeMeshDistance (40 m on 'high'): with the calibrated impostor albedo the switch is invisible there and
     // it keeps the vegetation under ~0.55M triangles per frame at the start view
     this.meshDist = tmd * 0.5;
@@ -890,12 +921,15 @@ export class TreeField {
     this.lod0Dist = THREE.MathUtils.clamp(tmd * 0.22, 11, 30);
     this.farDist = q.impostorDistance ?? 1800;
     this.shadowDist = Math.min(26, tmd * 0.33);   // LOD1 trees beyond this do not cast shadows (soft overcast sun)
+    // (LOWPOLISH) optional cap on the shadow-casting LOD1 range (preset treeShadowDist; debug ?tsd=<m>)
+    const tsd = +sp.get('tsd') || q.treeShadowDist;
+    if (tsd > 0) this.shadowDist = Math.min(this.shadowDist, tsd);
     this.band0 = 3.5;
     this.band1 = Math.max(6, this.meshDist * 0.09);
-    // blended coverage fringes (see glslCoverage): ultra / high on foliage + impostors, medium on impostors only
-    // (cheap), low none. Debug: ?fringe=all|near|imp|none (?nofringe = none).
-    const sp = new URLSearchParams(globalThis.location?.search || '');
-    const fr = sp.has('nofringe') ? 'none' : (sp.get('fringe') || (q.key === 'low' ? 'none' : q.key === 'medium' ? 'imp' : 'all'));
+    // blended coverage fringes (see glslCoverage): ultra / high on foliage + impostors, medium and low on impostors only
+    // (cheap: +0.15-0.2 ms on the M1 at 1280x720; on low it softens the cut-out silhouettes of the half-resolution
+    // impostor atlas against the sky). Debug: ?fringe=all|near|imp|none (?nofringe = none).
+    const fr = sp.has('nofringe') ? 'none' : (sp.get('fringe') || (q.key === 'low' || q.key === 'medium' ? 'imp' : 'all'));
     this.fringe = fr === 'all' || fr === 'near';      // mesh foliage
     this.impFringeOn = this.fringe || fr === 'imp';   // impostors
     // 'near': the mesh-foliage fringe only on LOD0 + the shadow-casting LOD1, handing over to the plain alpha test over
@@ -910,6 +944,9 @@ export class TreeField {
     FOLIAGE.gain0.value.set(this.fringe ? 1.3 : 2.0, 2.0);
     FOLIAGE.gain1.value.set(this.fringe ? 1.7 : 3.0, 3.0);
     FOLIAGE.impGain.value = this.impFringeOn ? 0.9 : 1.15;
+    // (LOWPOLISH) needle cards: really keep the bent crown normal on back faces (see createFoliageMaterial backFix).
+    // Off on every preset (the mesh / impostor brightness match was calibrated with the flip); evaluation flag ?treefix.
+    this.folBackFix = sp.has('treefix');
     this.group = new THREE_.Group();
     this.group.name = 'trees';
     ctx.scene.add(this.group);
@@ -948,7 +985,7 @@ export class TreeField {
     this.lodK = { l0: { value: new THREE.Vector2(0.0, 0.5) }, l1: { value: new THREE.Vector2(0.72, 0.75) } };
     this._setBands();
     const mk = {
-      fol: (lod, gain, lodK) => createFoliageMaterial({ map: folMap, normalMap: folNrm, lod, gain, lodK }),
+      fol: (lod, gain, lodK) => createFoliageMaterial({ map: folMap, normalMap: folNrm, lod, gain, lodK, groundFix: this.folBackFix }),
       bark: (lod, src, grey, lodK) => createBarkMaterial({
         map: src?.map, normalMap: src?.normalMap, arm: src?.roughnessMap || src?.metalnessMap || src?.aoMap, lod, lodK,
         color: grey ? new THREE.Color(0.92, 0.93, 0.95) : null,
@@ -956,8 +993,8 @@ export class TreeField {
     };
     const K = this.lodK;
     const matFol = { 0: mk.fol(this.lodU.l0, FOLIAGE.gain0, K.l0), 1: mk.fol(this.lodU.l1, FOLIAGE.gain1, K.l1) };
-    const matFolF = this.fringe ? { 0: createFoliageMaterial({ map: folMap, normalMap: folNrm, lod: this.lodU.l0, gain: FOLIAGE.gain0, lodK: K.l0, fringe: true }),
-      1: createFoliageMaterial({ map: folMap, normalMap: folNrm, lod: this.lodU.l1, gain: FOLIAGE.gain1, lodK: K.l1, fringe: true, fringeFade: true }) } : null;
+    const matFolF = this.fringe ? { 0: createFoliageMaterial({ map: folMap, normalMap: folNrm, lod: this.lodU.l0, gain: FOLIAGE.gain0, lodK: K.l0, fringe: true, groundFix: this.folBackFix }),
+      1: createFoliageMaterial({ map: folMap, normalMap: folNrm, lod: this.lodU.l1, gain: FOLIAGE.gain1, lodK: K.l1, fringe: true, fringeFade: true, groundFix: this.folBackFix }) } : null;
     const matBark = { 0: mk.bark(this.lodU.l0, bark, false, K.l0), 1: mk.bark(this.lodU.l1, bark, false, K.l1) };
     const matGrey = { 0: mk.bark(this.lodU.l0, barkGrey || bark, true, K.l0), 1: mk.bark(this.lodU.l1, barkGrey || bark, true, K.l1) };
     this.materials = [matFol[0], matFol[1], matBark[0], matBark[1], matGrey[0], matGrey[1]];
@@ -1044,9 +1081,11 @@ export class TreeField {
       applyCoverageMips(o.albedo, IMP_CUTOFF);
       const ib = IMP_BRIGHT[ctx.flags?.nopost ? 'off' : (q.ao || 'medium')] || IMP_BRIGHT.medium;
       FOLIAGE.impBright.value.set(ib[0], ib[1], ib[2]);
-      this.impMat = createImpostorMaterial(o.meta, o.albedo, o.normal);
+      // magnified-impostor detail on Low / Medium (their atlases are downscaled variants); ?impdetail / ?noimpdetail
+      const impDetail = sp.has('impdetail') || (!sp.has('noimpdetail') && (q.key === 'low' || q.key === 'medium'));
+      this.impMat = createImpostorMaterial(o.meta, o.albedo, o.normal, null, impDetail);
       this.materials.push(this.impMat);
-      if (this.impFringeOn) { this.impFringeMat = createImpostorMaterial(o.meta, o.albedo, o.normal, this.impMat); this.materials.push(this.impFringeMat); }
+      if (this.impFringeOn) { this.impFringeMat = createImpostorMaterial(o.meta, o.albedo, o.normal, this.impMat, impDetail); this.materials.push(this.impFringeMat); }
       this._setBands();
     }
   }
@@ -1272,6 +1311,9 @@ export class TreeField {
         const n = counts[vi][lod];
         for (const im of L.meshes) {
           im.count = n;
+          // (LOWPOLISH) an empty InstancedMesh still costs a full setProgram / uniform / VAO pass in three (main and
+          // shadow passes) before renderInstances() skips it: hide it instead (no visual change)
+          im.visible = n > 0;
           if (n) {
             im.instanceMatrix.clearUpdateRanges?.();
             im.instanceMatrix.addUpdateRange?.(0, n * 16);

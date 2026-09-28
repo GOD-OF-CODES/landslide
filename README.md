@@ -49,24 +49,24 @@ npm run preview      # serves dist/ at http://localhost:4173
 
 **Quality screen.** When the game opens, a quality screen comes up before the renderer is created or any heavy file is downloaded, because the preset decides what gets downloaded. On a first visit *Low* is preselected, so any machine can start; the screen also suggests a preset for your GPU (read from the WebGL renderer string) and shows each preset's download size. Arrow keys and Enter work as well as the mouse. After **Continue** the screen fades into the loading screen. The choice is remembered in `localStorage` and preselected on the next visit; you can change it later on the title screen (*Settings → Graphics quality*, which reloads the page) or with `?quality=ultra|high|medium|low` in the URL. The screen is skipped for `?quality=`, `?autostart` and the fixed-camera debug flags, and after a choice made earlier in the same tab.
 
-*Ultra* and *High* load the original full-quality assets. *Medium* and *Low* load lighter variants built by `node tools/make_variants.mjs` (`public/assets/q/`: WebP textures at 1024 px on Medium and 512 px on Low, except the asphalt and the cut-face rock, which keep 1024 px on Low, plus a 1k HDRI), and they lower the render resolution by themselves, in 10 % steps down to 55 %, if the frame rate stays under about 40 fps.
+*Ultra* and *High* load the original full-quality assets. *Medium* and *Low* load lighter variants built by `node tools/make_variants.mjs` (`public/assets/q/`: WebP textures at 1024 px on Medium and 512 px on Low, except the asphalt and the cut-face rock, which keep 1024 px on Low, plus a 1k HDRI; the models keep their exact geometry, re-encoded losslessly with meshopt), and they lower the render resolution by themselves, in 10 % steps down to 55 %, if the frame rate stays under about 40 fps.
 
 | Preset | Download | Render resolution | Sun shadow | AO | Wet-road reflections | Extras | Vegetation |
 |---|---|---|---|---|---|---|---|
-| **Ultra** | 88 MB | native, up to 2× DPR (Retina) | 4096², 70 m, lamp spot shadow | N8AO medium, full-res | screen-space, 20-step march (road + puddles) | camera motion blur at speed | grass 70 m, mesh trees 110 m |
-| **High** | 88 MB | 1× CSS pixels | 2048², 60 m | N8AO low, half-res | screen-space, 10-step march (road) | camera motion blur at speed | grass 55 m, mesh trees 80 m |
-| **Medium** | 37 MB | 0.8×, adaptive | 1024², 46 m | N8AO performance | screen "infinity" sample only | 1024 px textures; lighter terrain and road shaders | grass 40 m, mesh trees 55 m |
-| **Low** | 24 MB | 0.65×, adaptive | 1024², 40 m | off | env map only | 512 px textures; no bloom, no volumetric mist; lighter terrain, road, fog and sky shaders | grass 28 m, mesh trees 35 m |
+| **Ultra** | 89 MB | native, up to 2× DPR (Retina) | 4096², 70 m, lamp spot shadow | N8AO medium, full-res | screen-space, 20-step march (road + puddles) | camera motion blur at speed | grass 70 m, mesh trees 110 m |
+| **High** | 89 MB | 1× CSS pixels | 2048², 60 m | N8AO low, half-res | screen-space, 10-step march (road) | camera motion blur at speed | grass 55 m, mesh trees 80 m |
+| **Medium** | 33 MB | 0.8×, adaptive | 1024², 46 m | N8AO performance | screen "infinity" sample only | 1024 px textures; lighter terrain and road shaders | grass 40 m, mesh trees 55 m |
+| **Low** | 23 MB | 0.65×, adaptive | 1024², 40 m | off | env map only | 512 px textures; no bloom, no volumetric mist; lighter terrain, road, fog and sky shaders | grass 28 m, mesh trees 35 m |
 
-The download column counts the asset files (each file once). The code (JavaScript, WebAssembly, CSS) adds about 2.3 MB compressed. Loading the production build (`vite build` + `vite preview`, headless Chrome on the M1, network throttled to 25 Mbit/s, fresh cache, measured until the first frame of the game):
+The download column counts the asset files (each file once). The code (JavaScript, WebAssembly, CSS) adds about 2.4 MB compressed. Loading the production build (`vite build` + `vite preview`, headless Chrome on the M1, network throttled to 25 Mbit/s, fresh cache, measured until the first frame of the game):
 
 | Preset | Transferred | Time to the first frame at 25 Mbit/s |
 |---|---|---|
-| Low | 26.2 MB | 11.5 s |
-| Medium | 39.0 MB | 16.7 s |
-| High | 90.0 MB | 34.0 s |
+| Low | 25.8 MB | 11.5 s |
+| Medium | 35.0 MB | 15.8 s |
+| High | 91.5 MB | 34.9 s |
 
-The post chain is N8AO, a volumetric mist pass, a half-resolution history copy for the wet-road reflections, then bloom, a lens model (slight barrel distortion, lateral chromatic aberration, veiling glare, off-axis softness), AgX tone mapping and a colour grade, then SMAA, vignette and film grain. Eye adaptation is driven by a centre-weighted exposure meter that behaves like a phone camera (the tunnel mouth stays a dark hole until you are inside). The presets live in `src/core/config.js`. Under the overcast sky shadows are soft anyway, so High renders the sun's shadow map at 2048² (`sunShadowMapSize`), which saves about 1 ms a frame on the M1 compared with 4096².
+The post chain is N8AO, a volumetric mist pass, a half-resolution history copy for the wet-road reflections, then a depth-of-field pass (Ultra and High only; on only during the rockfall cinematic and while you inspect an item on foot, with the blur matched to a real thin lens so it stays subtle), bloom, a lens model (slight barrel distortion, lateral chromatic aberration, veiling glare, off-axis softness), AgX tone mapping and a colour grade, then SMAA, vignette and film grain. Eye adaptation is driven by a centre-weighted exposure meter that behaves like a phone camera (the tunnel mouth stays a dark hole until you are inside). The presets live in `src/core/config.js`. Under the overcast sky shadows are soft anyway, so High renders the sun's shadow map at 2048² (`sunShadowMapSize`), which saves about 1 ms a frame on the M1 compared with 4096².
 
 **Performance target:** at least 45 fps at 1280×720 on *High* on an Apple M1 (7-core GPU, 8 GB), within about 1.5 M triangles and 400 draw calls. The QA pass after the low-end work measured on a fanless MacBook Air M1 (headless Chrome, 1280×720, vsync-capped at 60 fps; the machine had been under GPU load for about three hours, so these are warm numbers). The low-end work did not change *Ultra* or *High*. Their terrain, road, tree, fog and sky shaders are byte-identical to the build before it; only the rockfall dust, tyre spray and rock-chip particle shaders differ, because a separate polish pass retuned them. Screenshots of the static scene at fixed viewpoints differ only by run-to-run noise (rain, film grain, wind), and the uncapped frame times below match the earlier measurements (19.4, 17.4, 19.3, 18.4 and 13.5 ms) within 0.2 ms.
 
@@ -115,6 +115,7 @@ The MacBook Air has no fan, so after 30–60 minutes of full GPU load it throttl
 - **Player:** a kinematic character controller. It can step over the fallen trunk.
 - **Rockfall:** convex-hull boulders on a "fair" timing model, so rocks land where a sensible driver can still avoid them, plus a mud-and-debris front that chases you. From about 60 m before the tunnel, rocks only fall behind the car, so the approach to the portal stays clear. If a boulder rolls the car onto its roof, the run ends after 2.5 s with a "The car rolled over" screen, rather than leaving you stuck until the front arrives.
 - **Interactions:** hold-to-use chopping (each blow widens a V notch in the trunk), refuelling and plank laying.
+- **First-person hands:** rigged, gloved hands in rain-jacket sleeves (`tools/blender/hands.py`, sized to an adult hand in a work glove: 19.5 cm long, 9 cm across the palm) hold the hatchet, the jerrycan and the planks, with a wind-up, strike and camera kick for each blow.
 
 ### Audio (`src/audio/`)
 Everything is procedural Web Audio: rain, wind, rumble, rock impacts, wood chops, footsteps on seven surfaces (asphalt, gravel, mud, rock, dirt, grass, wood), the fuel glug and the door clunk. The engine is an `AudioWorklet` synthesizer driven by rpm and load. One-shot sample banks are rendered in a Web Worker at start-up. There are no recorded samples.
@@ -129,6 +130,7 @@ node tools/gen_road.mjs                                     # road centreline ->
 $B -b -P tools/blender/terrain.py                           # terrain.glb + scatter.json: cut face, slide scar, gullies, washout, tunnel
 $B -b -P tools/blender/trees.py                             # trees.glb (spruce/fir LODs, fallen tree, shrubs) + impostor atlases
 $B -b -P tools/blender/rocks.py                             # rocks.glb: fractured granite/gneiss boulders, hulls, pebbles
+$B -b -P tools/blender/hands.py                             # hands.glb: gloved first-person hands in jacket sleeves, rigged, with poses
 $B -b --factory-startup -P tools/blender/props.py           # props.glb: jerrycan, hatchet, planks, barriers, light tower, guardrail...
 $B -b --python-exit-code 1 -P tools/blender/car.py          # car.glb + car.json: early-90s compact 4x4 with a full interior
 node tools/sky.mjs                                          # sky-dome textures from the 8k HDRI
@@ -181,6 +183,7 @@ DESIGN.md                   the design contract (world space, APIs, asset contra
 - **Textures and HDRI:** [Poly Haven](https://polyhaven.com), [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
   - HDRI: *overcast_soil_puresky*.
   - Textures: *asphalt_02, aerial_rocks_02, aerial_grass_rock, lichen_rock, dark_rock_02, marble_cliff_03, gray_rocks, mossy_rock, quarry_wall, rock_01, brown_mud_rocks_01, brown_mud_02, brown_mud_03, mud_forest, rocky_trail, forest_ground_04, precast_concrete_wall, concrete_wall_006, pine_bark, rough_wood, ash_veneer, hessian_230, rust_coarse_01*.
+  - Bake-only sources (read by the Blender scripts from `raw_assets/`, baked into the models' own textures, not shipped as separate files): *brown_leather* and *stretch_poplin* (the gloves and sleeves in `hands.glb`), *knotted_pine_bark* (the fallen spruce in `trees.glb`).
 - **Made from scratch for this project:** all 3D models (the car, trees, rocks, props, the tunnel), the terrain, and all audio.
 - **Libraries:** [three.js](https://threejs.org) (MIT), [Rapier](https://rapier.rs) (Apache-2.0), [postprocessing](https://github.com/pmndrs/postprocessing) (Zlib), [N8AO](https://github.com/N8python/n8ao) (ISC), [Vite](https://vite.dev) (MIT).
 - **Font:** [Barlow](https://fonts.google.com/specimen/Barlow) (SIL OFL), loaded from Google Fonts with an offline fallback.

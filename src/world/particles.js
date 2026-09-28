@@ -453,12 +453,12 @@ class DustSystem {
    *  path: buoy < 0 is its net fall acceleration). aspect > 1 = wide sprite. drag k (1/s). soft 0..1 = wet, blurred mist. */
   emit(p, vel, life, size0, size1, opacity, col, ground, buoy = 0.15, lit = 1, aspect = 1, drag = 1.3, soft = 0, water = 0) {
     const i = this.head; this.head = (this.head + 1) % this.cap;
-    this.aPos.array.set([p.x, p.y, p.z], i * 3);
-    this.aVel.array.set([vel.x, vel.y, vel.z], i * 3);
-    this.aTime.array.set([this.time, life, ground, Math.random()], i * 4);
-    this.aSize.array.set([size0, size1, opacity, buoy], i * 4);
-    this.aCol.array.set([col.r, col.g, col.b, lit], i * 4);
-    this.aExt.array.set([aspect, drag, soft, water], i * 4);
+    { const A = this.aPos.array, o = i * 3; A[o] = p.x; A[o + 1] = p.y; A[o + 2] = p.z; }
+    { const A = this.aVel.array, o = i * 3; A[o] = vel.x; A[o + 1] = vel.y; A[o + 2] = vel.z; }
+    { const A = this.aTime.array, o = i * 4; A[o] = this.time; A[o + 1] = life; A[o + 2] = ground; A[o + 3] = Math.random(); }
+    { const A = this.aSize.array, o = i * 4; A[o] = size0; A[o + 1] = size1; A[o + 2] = opacity; A[o + 3] = buoy; }
+    { const A = this.aCol.array, o = i * 4; A[o] = col.r; A[o + 1] = col.g; A[o + 2] = col.b; A[o + 3] = lit; }
+    { const A = this.aExt.array, o = i * 4; A[o] = aspect; A[o + 1] = drag; A[o + 2] = soft; A[o + 3] = water; }
     this._dirtyLo = Math.min(this._dirtyLo, i); this._dirtyHi = Math.max(this._dirtyHi, i);
   }
   update(dt) {
@@ -572,10 +572,10 @@ class ChipSystem {
   }
   emit(p, v, life, scale, kind, ground, spin) {
     const i = this.head; this.head = (this.head + 1) % this.cap;
-    this.aP0.array.set([p.x, p.y, p.z], i * 3);
-    this.aV.array.set([v.x, v.y, v.z], i * 3);
-    this.aT.array.set([this.time, life, ground, spin], i * 4);
-    this.aS.array.set([scale, kind, Math.random(), 0], i * 4);
+    { const A = this.aP0.array, o = i * 3; A[o] = p.x; A[o + 1] = p.y; A[o + 2] = p.z; }
+    { const A = this.aV.array, o = i * 3; A[o] = v.x; A[o + 1] = v.y; A[o + 2] = v.z; }
+    { const A = this.aT.array, o = i * 4; A[o] = this.time; A[o + 1] = life; A[o + 2] = ground; A[o + 3] = spin; }
+    { const A = this.aS.array, o = i * 4; A[o] = scale; A[o + 1] = kind; A[o + 2] = Math.random(); A[o + 3] = 0; }
     this._lo = Math.min(this._lo, i); this._hi = Math.max(this._hi, i);
   }
   update(dt) {
@@ -736,10 +736,10 @@ class DropSystem {
   /** delay (s) lets a drip start in the future; life should cover the fall to 'ground'. */
   emit(p, v, life, ground, dMm, drag, gain = 1, delay = 0) {
     const i = this.head; this.head = (this.head + 1) % this.cap;
-    this.aP0.array.set([p.x, p.y, p.z], i * 3);
-    this.aV0.array.set([v.x, v.y, v.z], i * 3);
-    this.aT.array.set([this.time + delay, life, ground, dMm], i * 4);
-    this.aK.array.set([drag, gain], i * 2);
+    { const A = this.aP0.array, o = i * 3; A[o] = p.x; A[o + 1] = p.y; A[o + 2] = p.z; }
+    { const A = this.aV0.array, o = i * 3; A[o] = v.x; A[o + 1] = v.y; A[o + 2] = v.z; }
+    { const A = this.aT.array, o = i * 4; A[o] = this.time + delay; A[o + 1] = life; A[o + 2] = ground; A[o + 3] = dMm; }
+    { const A = this.aK.array, o = i * 2; A[o] = drag; A[o + 1] = gain; }
     this._lo = Math.min(this._lo, i); this._hi = Math.max(this._hi, i);
   }
   update(dt) {
@@ -1018,8 +1018,8 @@ class SplashSystem {
   }
   emit(p, size, life = 0.12, delay = 0) {
     const i = this.head; this.head = (this.head + 1) % this.cap;
-    this.aP.array.set([p.x, p.y, p.z, this.time + delay], i * 4);
-    this.aS.array.set([size, Math.random(), life], i * 3);
+    { const A = this.aP.array, o = i * 4; A[o] = p.x; A[o + 1] = p.y; A[o + 2] = p.z; A[o + 3] = this.time + delay; }
+    { const A = this.aS.array, o = i * 3; A[o] = size; A[o + 1] = Math.random(); A[o + 2] = life; }
     this._lo = Math.min(this._lo, i); this._hi = Math.max(this._hi, i);
   }
   update(dt) {
@@ -1559,7 +1559,10 @@ export default class Particles {
     this.rain = new RainSystem(ctx, Math.round(30000 * (q.rain ?? 0.8)), this.shared);
     this.drops = new DropSystem(ctx, 1600, this.shared);
     this.splashes = new SplashSystem(ctx, 1600, this.shared);
-    const veilLayers = key === 'ultra' || key === 'high' ? 3 : key === 'medium' ? 2 : 0;
+    // (LOWPOLISH) Low keeps the near 8 m rain shell and the distant rain shafts over the valley slopes (one
+    // full-screen pass, ~0.05 ms at the Low resolution): without it the far forest stayed crisp in the rain.
+    const vq = new URLSearchParams(globalThis.location?.search || '').get('veil');   // debug: ?veil=0..3 overrides
+    const veilLayers = vq !== null ? +vq : key === 'ultra' || key === 'high' ? 3 : key === 'medium' ? 2 : 1;
     if (veilLayers && expectSoft(ctx)) this.veil = new RainVeil(ctx, this.shared, veilLayers);
     // ground splash mist: big, soft, low-alpha sprites (~1 screen of overdraw) -> high and ultra only
     this.mist = key === 'ultra' || key === 'high' ? new DustSystem(ctx, 160, 'fx_rain_mist') : null;

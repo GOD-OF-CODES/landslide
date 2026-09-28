@@ -18,8 +18,10 @@ const ORDER = ['low', 'medium', 'high', 'ultra'];
 /** Download per preset in MB, measured on the production build: the asset files each preset requests at boot, each
  *  file counted once (QA: brown_mud_rocks_01 and car.glb are requested twice, the second time a 304 from the cache,
  *  which the earlier count included: High read 95). Code (JS, wasm, CSS) adds about 2.3 MB more on the wire.
- *  Shared with the loading screen, which counts the same bytes. config.js `download` is only a fallback. */
-export const DOWNLOAD_MB = { low: 25, medium: 37, high: 88, ultra: 88 };
+ *  Shared with the loading screen, which counts the same bytes. config.js `download` is only a fallback.
+ *  Re-measured after round 6 (hands.glb, fallen spruce v2, variants re-encoded with lossless meshopt geometry):
+ *  low 23.4, medium 32.6, high/ultra 89.1 MB. */
+export const DOWNLOAD_MB = { low: 23, medium: 33, high: 89, ultra: 89 };
 export const QUALITY_INFO = INFO;
 const BACKDROP = `<div class="bd"><div class="bd-topo"></div>
   <div class="bd-ridge far"></div><div class="bd-fog f1"></div><div class="bd-ridge near"></div><div class="bd-fog f2"></div>
