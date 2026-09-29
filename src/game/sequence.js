@@ -319,30 +319,41 @@ export default class Sequence {
     });
 
     // ---- seated: start engine / get out
+    // E (touch: Interact) always gets you in or out. The engine starts with the throttle instead (W / Up arrow,
+    // touch Gas): see _updateIgnition(). The start_engine entry stays registered (never usable) so tools can call use().
     ia.register({
-      id: 'start_engine', mode: 'car', priority: 5,
+      id: 'start_engine', mode: 'car', priority: 0,
       prompt: 'Start the engine',
-      hint: () => {
-        if (this.ctx.control !== 'car' || this.car?.engineOn || !(this.car?.fuel > 0.001)) return null;
-        if (!this.ctx.vegetation?.fallenTree?.cut && this._carBeforeTree()) return 'The fallen tree still blocks the road';
-        if (!inv.has('planks') && !this.ctx.props?.bridge && this._carBeforeGap()) return 'Get the planks first: the road ahead is washing out';
-        return null;
-      },
-      canUse: () => {
-        const car = this.car;
-        if (this.ctx.control !== 'car' || !car || car.engineOn || !(car.fuel > 0.001) || (car.cranking > 0)) return false;
-        if (!this.ctx.vegetation?.fallenTree?.cut && this._carBeforeTree()) return false;
-        if (!inv.has('planks') && !this.ctx.props?.bridge && this._carBeforeGap()) return false;
-        return true;
-      },
+      canUse: () => false,
       use: () => self._tryStart(),
     });
     ia.register({
-      id: 'get_out', mode: 'car', priority: 1,
+      id: 'get_out', mode: 'car', priority: 5,
       prompt: 'Get out',
-      canUse: () => this.ctx.control === 'car' && ['stalled', 'driving', 'escape'].includes(this.state) && Math.abs(this.car?.speed ?? 0) < 1.2,
+      canUse: () => this.ctx.control === 'car' && ['stalled', 'onfoot', 'driving', 'escape'].includes(this.state) && Math.abs(this.car?.speed ?? 0) < 2,
       use: () => self._getOut(),
     });
+  }
+
+  /** Seated with the engine off: pressing (or holding) the throttle turns the key. First try coughs (flooded). */
+  _updateIgnition(dt) {
+    const car = this.car, inp = this.ctx.input;
+    this._ignCd = Math.max(0, (this._ignCd || 0) - dt);
+    if (this.ctx.control !== 'car' || !car || car.engineOn || !inp || !['stalled', 'onfoot', 'driving', 'escape'].includes(this.state)) {
+      this._ignHeld = false;
+      return;
+    }
+    const held = inp.down('KeyW') || inp.down('ArrowUp');
+    const tap = inp.pressed('KeyW') || inp.pressed('ArrowUp');
+    const want = tap || (held && this._ignHeld);   // a tap, or keep holding to retry once the starter has stopped
+    this._ignHeld = held;
+    if (!want || this._ignCd > 0 || car.cranking > 0) return;
+    const inv = this.inventory;
+    if (!(car.fuel > 0.001)) { if (!tap) return; this._ignCd = 3; this._say(this.flags.refueled ? 'Nothing...' : 'It will not start. The tank is bone dry.', 2.2); return; }
+    if (!this.ctx.vegetation?.fallenTree?.cut && this._carBeforeTree()) { this._ignCd = 3; this._say('No point. The fallen tree still blocks the road.', 2.4); return; }
+    if (!inv.has('planks') && !this.ctx.props?.bridge && this._carBeforeGap()) { this._ignCd = 3; this._say('Get the planks first. The road ahead is washing out.', 2.6); return; }
+    this._ignCd = 1.9;
+    this._tryStart();
   }
 
   _carBeforeTree() { const pr = this.carProj(); return !pr || pr.s < (this.markers.fallenTree ?? 305) + 3; }
@@ -513,7 +524,7 @@ export default class Sequence {
       else if (F.roadworksSeen && !inv.has('planks') && !bridge) t = 'Take the scaffold planks from the roadworks';
       else if (!treeCut && inv.has('hatchet')) t = 'Cut through the fallen tree';
       else if (inv.has('jerrycan')) t = 'Refuel the car';
-      else if (this.ctx.control === 'car') t = 'Start the engine';
+      else if (this.ctx.control === 'car') t = this.ctx.input?.touch ? 'Press Gas to start the engine' : 'Press W to start the engine';
       else t = 'Get in the car';
     } else if (st === 'driving' || st === 'escape') {
       const pr = this.carProj();
@@ -798,6 +809,7 @@ export default class Sequence {
         for (const a of due) { try { a.fn(); } catch (e) { console.error('[game] timer', e); } }
       }
     }
+    this._updateIgnition(rdt);
     // slow-mo ramp back (real time)
     if (this._slowmo) {
       const S = this._slowmo;
