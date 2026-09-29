@@ -5,10 +5,12 @@ import { config, PARAMS, storedQuality } from './core/config.js';
 import { showQualityGate } from './ui/gate.js';
 import { isStaleChunkError, recoverFromStaleBuild, showFatal } from './core/recover.js';
 import { platform, installIframeGuards } from './core/platform.js';
+import { installFpsCounter } from './ui/fps.js';
 
 // CrazyGames: iframe input guards and SDK init as early as possible (init never throws; standalone = 'disabled')
 installIframeGuards();
 platform.init();
+installFpsCounter(); // on-screen FPS (Settings > Show FPS), off by default
 
 const mainModule = import('./main.js'); // starts downloading now; main.js does nothing until start() is called
 mainModule.catch(() => {});

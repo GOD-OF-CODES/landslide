@@ -670,15 +670,19 @@ export default class Vehicle {
       thrIn = a.throttle; brkIn = a.brake; steerIn = a.steer;
     } else if (human) {
       driven = true;
-      const w = input.down('KeyW') || input.down('ArrowUp');
-      const sDown = input.down('KeyS') || input.down('ArrowDown');
+      // keyboard (digital) combined with the touch layer's analog axes (input.axes: steer + = right, pedals 0..1)
+      const ax = input.axes;
+      const wA = Math.max(input.down('KeyW') || input.down('ArrowUp') ? 1 : 0, clamp(ax?.throttle || 0, 0, 1));
+      const sA = Math.max(input.down('KeyS') || input.down('ArrowDown') ? 1 : 0, clamp(ax?.brake || 0, 0, 1));
+      const w = wA > 0.05, sDown = sA > 0.05;
       steerIn = (input.down('KeyA') || input.down('ArrowLeft') ? 1 : 0) - (input.down('KeyD') || input.down('ArrowRight') ? 1 : 0);
+      if (ax?.steer) steerIn = clamp(steerIn - ax.steer, -1, 1);
       hb = input.down('Space');
       if (this.gear >= 0) {
-        thrIn = w ? 1 : 0; brkIn = sDown ? 1 : 0;
+        thrIn = wA; brkIn = sA;
         if (sDown && !w && v < 0.7) { this._revHold += h; if (this._revHold > 0.22) { this._shift(-1); this._revHold = 0; } } else this._revHold = 0;
       } else {
-        thrIn = sDown ? 1 : 0; brkIn = w ? 1 : 0;
+        thrIn = sA; brkIn = wA;
         if (w && !sDown && v > -0.7) { this._fwdHold += h; if (this._fwdHold > 0.15) { this._shift(1); this._fwdHold = 0; } } else this._fwdHold = 0;
       }
     }
@@ -693,7 +697,7 @@ export default class Vehicle {
     if (this.aiInput || this.autopilot) {
       this.steer = approach(this.steer, steerIn, 3.0 * h);
     } else if (steerIn !== 0) {
-      const opposite = this.steer !== 0 && Math.sign(this.steer) !== steerIn;
+      const opposite = this.steer !== 0 && Math.sign(this.steer) !== Math.sign(steerIn);
       const rateIn = 2.1 / (1 + vAbs / 16);
       this.steer = approach(this.steer, steerIn, (opposite ? rateIn + 2.2 : rateIn) * h);
     } else {

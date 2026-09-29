@@ -6,7 +6,13 @@
 // centred wordmark and kicker, the .load-foot row), so the hand-over is seamless: on Continue the choices fade out and
 // a "Preparing" bar takes their place in the exact spot where the HUD's loading bar appears; the gate then stays up
 // until the HUD has built its loading screen underneath, and fades away over it.
+//
+// Touch UI (RESPONSIVE): this module is the first UI code to run (src/boot.js imports it), so it also decides the touch
+// UI mode for every screen: `html.touch` is set here before any screen exists (style.css scopes every touch rule under
+// it, so desktop is untouched), the "Rotate your device" overlay is installed (CSS shows it in portrait), and iOS
+// pinch/double-tap zoom is blocked. The HUD re-syncs the mode with ctx.input.touch once the input exists.
 import { QUALITY_PRESETS } from '../core/config.js';
+import * as CFG from '../core/config.js'; // namespace import: DEVICE may be absent (then the local fallback is used)
 
 const INFO = {
   low: { title: 'Low', blurb: 'Runs on most laptops and integrated graphics. Lighter textures, fewer effects.' },
@@ -26,6 +32,97 @@ export const QUALITY_INFO = INFO;
 const BACKDROP = `<div class="bd"><div class="bd-topo"></div>
   <div class="bd-ridge far"></div><div class="bd-fog f1"></div><div class="bd-ridge near"></div><div class="bd-fog f2"></div>
   <div class="bd-rain r1"></div><div class="bd-rain r2"></div><div class="bd-grain"></div></div>`;
+
+// ------------------------------------------------------------------------------------------------ touch UI mode
+/** Touch-primary device (phone, tablet)? ?touch=1 / ?touch=0 force either mode. Uses the shared detection
+ *  (core/config.js DEVICE.touch) when it exists; the fallback mirrors it: coarse primary pointer + touch points/events
+ *  (a touchscreen laptop driven by a mouse or trackpad stays in desktop mode). */
+export function detectTouchUI() {
+  const d = CFG.DEVICE;
+  if (d && typeof d.touch === 'boolean') return d.touch;
+  try {
+    const p = new URLSearchParams(location.search).get('touch');
+    if (p === '1' || p === 'true' || p === 'on' || p === '') return true;
+    if (p === '0' || p === 'false' || p === 'off') return false;
+  } catch {}
+  try {
+    const tp = (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+    return tp && !!window.matchMedia?.('(pointer: coarse)').matches;
+  } catch { return false; }
+}
+let touchUI = false;
+export const isTouchUI = () => touchUI;
+/** Switch the touch UI on/off (html.touch + the rotate overlay). The HUD calls this with ctx.input.touch. */
+export function setTouchUI(on) {
+  touchUI = !!on;
+  const html = document.documentElement;
+  html.classList.toggle('touch', touchUI);
+  if (touchUI) { installRotateOverlay(); installZoomGuards(); }
+}
+
+const PHONE_SVG = `<svg class="ro-phone" viewBox="0 0 160 160" aria-hidden="true">
+  <path class="ro-arrow" d="M122 52 A52 52 0 0 0 76 28" fill="none" stroke-width="1.6" stroke-linecap="round"/>
+  <path class="ro-arrow" d="M83 23.5 L75.5 28 L82.5 33" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <g class="ro-body">
+    <rect x="61" y="44" width="38" height="72" rx="7" fill="rgba(10,12,13,.6)" stroke-width="2"/>
+    <rect x="65.5" y="53" width="29" height="54" rx="1.5" class="ro-screen"/>
+    <line x1="75" y1="48.5" x2="85" y2="48.5" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="74" y1="111.5" x2="86" y2="111.5" stroke-width="1.4" stroke-linecap="round" opacity=".6"/>
+  </g>
+  <path class="ro-glyph" d="M66 90 L76 71 L82 80 L86 75 L94 90 Z"/>
+</svg>`;
+
+/** "Rotate your device": built once, on touch devices only; style.css shows it in portrait (above the gate and every
+ *  screen, below the WebGL "tap to reload" screen). The HUD pauses the game while it is up. */
+function installRotateOverlay() {
+  if (document.getElementById('rotate-overlay') || !document.body) return;
+  const el = document.createElement('div');
+  el.id = 'rotate-overlay';
+  el.setAttribute('role', 'alertdialog');
+  el.setAttribute('aria-label', 'Rotate your device to landscape');
+  el.innerHTML = `${BACKDROP}
+    <div class="ro-center">
+      <div class="brand-mark">LANDSLIDE</div>
+      <div class="load-kicker">A mountain road. Rain. No way back.</div>
+      ${PHONE_SVG}
+      <div class="ro-title">Rotate your device</div>
+      <p class="ro-sub">Landslide is played in landscape. Turn your device sideways to continue.</p>
+    </div>`;
+  // nothing under the overlay reacts to a stray touch
+  const stop = (e) => { if (e.cancelable) e.preventDefault(); e.stopPropagation(); };
+  for (const t of ['touchstart', 'touchmove', 'touchend', 'pointerdown', 'click']) el.addEventListener(t, stop, { passive: false });
+  document.body.appendChild(el);
+}
+
+/** iOS Safari ignores user-scalable=no: block its pinch gesture events and double-tap zoom (touch-action in style.css
+ *  covers the rest). */
+let zoomGuards = false;
+function installZoomGuards() {
+  if (zoomGuards) return;
+  zoomGuards = true;
+  const no = (e) => { if (e.cancelable) e.preventDefault(); };
+  for (const t of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(t, no, { passive: false });
+  document.addEventListener('dblclick', no, { passive: false });
+}
+
+// Test hook: ?safe=l,t,r,b fakes the safe-area insets in px (emulators report 0), e.g. ?safe=47,0,47,21 (iPhone).
+try {
+  const s = new URLSearchParams(location.search).get('safe');
+  if (s) {
+    const [l = 0, t = 0, r = 0, b = 0] = s.split(',').map((v) => Math.max(0, +v || 0));
+    const st = document.documentElement.style;
+    st.setProperty('--sa-l', l + 'px'); st.setProperty('--sa-t', t + 'px'); st.setProperty('--sa-r', r + 'px'); st.setProperty('--sa-b', b + 'px');
+  }
+} catch {}
+setTouchUI(detectTouchUI());
+// phones and tablets: the preset blurbs speak about the device in hand (the numbers come from core/config.js)
+const TOUCH_BLURB = {
+  low: 'Best for most phones. Lighter textures and fewer effects for a smooth frame rate.',
+  medium: 'For recent phones and tablets. Sharper textures and softer shadows.',
+  high: 'Full-quality textures and effects. For the newest high-end phones and tablets.',
+  ultra: 'Everything at maximum. Very demanding on a phone or tablet.',
+};
+if (touchUI) for (const k of ORDER) INFO[k].blurb = TOUCH_BLURB[k];
 
 /** Rough device hint from the WebGL renderer string. It's only a suggestion; the player decides. */
 export function recommendQuality() {
@@ -64,7 +161,7 @@ export function showQualityGate(initial = 'low') {
     <p class="qg-blurb" aria-live="polite"></p>
     <div class="qg-actions">
       <button type="button" class="m-item primary qg-go"><span class="m-bar"></span><span class="m-label">Continue</span></button>
-      <span class="qg-note">You can change this later in Settings. Low and Medium also lower the resolution by themselves if the game stutters.</span>
+      <span class="qg-note">${touchUI ? 'You can change this later in Settings. The game lowers its resolution by itself if it stutters.' : 'You can change this later in Settings. Low and Medium also lower the resolution by themselves if the game stutters.'}</span>
     </div>
   </div>
   <div class="load-foot qg-prep" aria-hidden="true">
@@ -94,7 +191,8 @@ export function showQualityGate(initial = 'low') {
     blurb.textContent = INFO[sel].blurb;
   };
   paint(false);
-  setTimeout(() => { if (!root.classList.contains('leaving')) opts.find((b) => b.dataset.q === sel)?.focus({ preventScroll: true }); }, 60);
+  // keyboard users start on the selected option (touch: no focus ring, the selection itself is the highlight)
+  if (!touchUI) setTimeout(() => { if (!root.classList.contains('leaving')) opts.find((b) => b.dataset.q === sel)?.focus({ preventScroll: true }); }, 60);
 
   return new Promise((resolve) => {
     let finished = false;

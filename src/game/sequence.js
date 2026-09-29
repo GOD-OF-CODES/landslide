@@ -69,6 +69,12 @@ export default class Sequence {
     this.ctx = ctx;
     const g = ctx.config?.game || {};
     this.tune = { ...DEFAULTS, ...g, ...ESCAPE_OVERRIDES, debrisFront: { ...DEFAULTS.debrisFront, ...(g.debrisFront || {}), ...ESCAPE_OVERRIDES.debrisFront } };
+    // Touch assist: on-screen controls are slower than a keyboard (walking back to the car door, laying the planks),
+    // so on touch devices the chasing front creeps a little slower. Desktop tuning is unchanged.
+    if (ctx.input?.touch) {
+      this.tune.frontFloor = (this.tune.frontFloor ?? 1.5) * 0.66;
+      this.tune.debrisFront.chaseSpeed *= 0.9;
+    }
     this.state = 'title';
     this.checkpoint = 'intro';
     this.inventory = new Inventory(ctx);

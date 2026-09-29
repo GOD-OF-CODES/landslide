@@ -143,6 +143,28 @@ node tools/sky.mjs                                          # sky-dome textures 
 - Each script has options (`--stage`, `--only`, `--fast`, …) documented at its top.
 - `public/assets/tex/` holds the engine's resized copies of the Poly Haven texture sets. `raw_assets/` (git-ignored) holds the full-size downloads that the Blender bakes and the sky tool read.
 
+## Mobile (phones and tablets)
+
+The game plays fully by touch on iOS Safari and Android Chrome, in landscape (a "Rotate your device" screen appears in
+portrait and pauses the game). Touch mode is detected automatically; `?touch=1` / `?touch=0` force it either way.
+
+- **On foot:** a floating move stick in the left part of the screen (push it all the way to sprint), drag on the right to
+  look, plus **Interact** (appears with the prompt; hold it to chop, refuel or lay the planks), **Jump** and **Sprint**.
+- **In the car:** a **Steer** slider on the left, **Gas** and **Brake / Reverse** pedals, handbrake, camera and
+  **Get out / Get in** on the right.
+- **Everywhere:** a **Pause** button (top right). Move, look and a button all work at the same time (multi-touch).
+- **Layout:** every screen (quality choice, loading, title, pause, settings, death, win) fits small landscape phones,
+  respects notches/safe areas, and never zooms or scrolls the page.
+- **Performance:** on phones the quality screen suggests Low, and a mobile adjustment sits on top of every preset (lower
+  render resolution, smaller shadow maps, lighter effects, automatic resolution scaling). Tablets can still choose
+  High/Ultra. iOS audio unlocks on the first tap; a device that resets the graphics shows "Tap to reload"; a browser
+  without WebGL2 gets a clear message.
+- **Fairness:** touch controls are a little slower than a keyboard, so on touch devices the chasing mud front creeps
+  slightly slower. Desktop difficulty is unchanged.
+
+**Show FPS:** Settings has a *Show FPS* switch (off by default, remembered) that shows frames per second, frame time and
+the worst frame of the last half second in the top-left corner, on desktop and mobile.
+
 ## CrazyGames
 
 The game is ready to run inside the CrazyGames iframe (HTML5 SDK v3, loaded in `index.html`). All platform code is in

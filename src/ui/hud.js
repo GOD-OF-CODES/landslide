@@ -6,12 +6,18 @@
 // Extras: letterbox(bool|null), hideHud(bool), pause(), resume(), settings (object), playTime (s).
 // Emits: ui:start {auto}, ui:pause, ui:resume, ui:retry, ui:quit, ui:settings {settings}.
 // Every method is safe to call at any time (before boot, with a missing ctx, with other systems absent).
+// Touch (phones/tablets; html.touch, decided in gate.js and re-synced here with ctx.input.touch): the same screens with
+// larger tap targets and compact layouts (style.css), touch tips and controls help (setControlsHelp(groups) replaces
+// the default list), a tap glyph instead of the key cap in prompts, HUD elements kept to the top-left / top-centre (the
+// bottom corners belong to the touch controls), and the game pauses while the "Rotate your device" overlay is up
+// (portrait) and resumes on rotating back (only if that overlay paused it). `rotateBlocked` is true while it is up.
 import { ICONS, ITEM_NAMES } from './icons.js';
 import { Cluster } from './gauges.js';
-import { DOWNLOAD_MB, QUALITY_INFO } from './gate.js';
+import { DOWNLOAD_MB, QUALITY_INFO, isTouchUI, setTouchUI } from './gate.js';
+import { setFpsVisible } from './fps.js';
 
 const SETTINGS_KEY = 'landslide.settings';
-const DEFAULTS = { sensitivity: 1, invertY: false, volume: 0.8, subtitles: true };
+const DEFAULTS = { sensitivity: 1, invertY: false, volume: 0.8, subtitles: true, showFps: false };
 const BASE_SENS = 0.0022;
 const QUALITY_KEYS = ['low', 'medium', 'high', 'ultra'];
 
@@ -26,6 +32,13 @@ const TIPS = [
   'Headphones recommended.',
   'A 20 litre jerrycan is heavy. A few litres will still get an old engine running.',
 ];
+
+// touch devices: the same tips without keyboard keys
+const TIPS_TOUCH = TIPS.map((t) => ({
+  'Hold the key to use a tool. Let go and you start the job over.': 'Hold the Interact button to use a tool. Let go and you start the job over.',
+  'Hold Shift to sprint. Stamina runs out fast on a climb.': 'Sprinting burns stamina fast. It runs out quickly on a climb.',
+  'Press C in the car to switch between the cockpit and the chase camera.': 'In the car, the camera button switches between the cockpit and the chase view.',
+}[t] || t));
 
 const LOAD_LABELS = {
   env: 'Hanging the clouds', terrain: 'Carving the mountain', vegetation: 'Growing the forest',
@@ -67,6 +80,22 @@ const CONTROLS = [
   ['General', [['Tab', 'Show objective'], ['Esc', 'Pause']]],
 ];
 
+// Controls help on touch devices: [control, action]. The on-screen controls are drawn by the touch layer
+// (src/ui/touch.js); hud.setControlsHelp(groups) replaces this default with its exact names.
+const CONTROLS_TOUCH = [
+  ['On foot', [['Left side', 'Move (push to the edge to sprint)'], ['Right side', 'Drag to look around'], ['Sprint', 'Sprint on / off'],
+    ['Jump', 'Jump'], ['Interact', 'Use / hold to chop, pour, lay planks']]],
+  ['Driving', [['Left side', 'Slide to steer'], ['Gas', 'Throttle'], ['Brake', 'Brake, hold to reverse'], ['Handbrake', 'Handbrake'],
+    ['Camera', 'Cockpit / chase camera'], ['Interact', 'Get in / out, start the engine']]],
+  ['General', [['Pause', 'Pause (top right)'], ['Right side', 'Drag to look around']]],
+];
+
+// prompt glyph on touch devices (instead of a key cap): a fingertip tap
+const TAP_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+  <path d="M9.6 14.6V5.3a1.55 1.55 0 0 1 3.1 0V11"/><path d="M12.7 10.9a1.5 1.5 0 0 1 3 0v1.2"/>
+  <path d="M15.7 11.6a1.5 1.5 0 0 1 3 0v3.6c0 3.3-2.4 5.9-5.6 5.9h-1.2c-2 0-3.3-.8-4.4-2.2l-2.3-3a1.4 1.4 0 0 1 2.1-1.8l2.3 2.2"/>
+  <path d="M6.3 6.1a5 5 0 0 1 1.6-3.4M16 2.7a5 5 0 0 1 1.6 3.4" opacity=".7"/></svg>`;
+
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 function el(tag, cls, html) {
   const e = document.createElement(tag);
@@ -84,6 +113,11 @@ function fmtTime(sec) {
 export default class Hud {
   constructor(ctx) {
     this.ctx = ctx || {};
+    // touch UI: the input layer decides whether touch controls exist, so it has the last word on the mode
+    try { if (typeof this.ctx.input?.touch === 'boolean' && this.ctx.input.touch !== isTouchUI()) setTouchUI(this.ctx.input.touch); } catch {}
+    this.touch = isTouchUI();
+    this._touchControls = CONTROLS_TOUCH;
+    this.rotateBlocked = false;
     this.el = null;
     this.started = false;
     this.screen = null;
@@ -107,7 +141,7 @@ export default class Hud {
   _build() {
     let root = document.getElementById('ui');
     if (!root) { root = el('div'); root.id = 'ui'; document.body.appendChild(root); }
-    root.innerHTML = '';
+    // (no wipe: #ui is empty on a fresh page, dispose() clears it, and other layers may already have mounted in it)
     this.root = root;
     // reveal display type once the web font is in (or after a timeout offline), so nothing reflows
     const ready = () => root.classList.add('fonts-ready');
@@ -118,10 +152,13 @@ export default class Hud {
 
     // --- in-game HUD layer
     const hud = this.hudEl = el('div', 'hud');
+    // touch: the objective and the inventory share a column in the top-left corner (the bottom corners hold the
+    // touch controls), so a two-line objective pushes the inventory down instead of running into it
+    const OBJ = '<div class="objective" aria-live="polite"><div class="obj-label">Objective</div><div class="obj-text"></div></div>';
     hud.innerHTML = `
       <div class="vignette"></div>
       <div class="lb lb-top"></div><div class="lb lb-bot"></div>
-      <div class="objective" aria-live="polite"><div class="obj-label">Objective</div><div class="obj-text"></div></div>
+      ${this.touch ? `<div class="hud-tl">${OBJ}<div class="inventory"></div></div>` : OBJ}
       <div class="toasts" aria-live="polite"></div>
       <div class="reticle"><div class="dot"></div>
         <svg class="stamina" viewBox="0 0 40 40"><circle cx="20" cy="20" r="16" class="st-bg"/><circle cx="20" cy="20" r="16" class="st-fg"/></svg>
@@ -130,7 +167,7 @@ export default class Hud {
         <div class="key"><svg class="ring" viewBox="0 0 44 44"><circle cx="22" cy="22" r="19.5" class="r-bg"/><circle cx="22" cy="22" r="19.5" class="r-fg"/></svg><span class="key-cap">E</span></div>
         <div class="prompt-text"><span class="p-k">Hold</span><span class="p-l"></span></div>
       </div>
-      <div class="inventory"></div>
+      ${this.touch ? '' : '<div class="inventory"></div>'}
       <div class="subtitle" aria-live="polite"><span class="sub-speaker"></span><span class="sub-text"></span></div>`;
     this.cluster = new Cluster();
     hud.appendChild(this.cluster.el);
@@ -193,8 +230,9 @@ export default class Hud {
       </div>`;
     this.$load = { bar: L.querySelector('.load-bar i'), barBox: L.querySelector('.load-bar'), pct: L.querySelector('.load-pct'), label: L.querySelector('.load-label'),
       tip: L.querySelector('.load-tip'), q: L.querySelector('.load-q'), eta: L.querySelector('.load-eta') };
-    this._tipIdx = Math.floor(Math.random() * TIPS.length);
-    this.$load.tip.textContent = TIPS[this._tipIdx];
+    this._tips = this.touch ? TIPS_TOUCH : TIPS;
+    this._tipIdx = Math.floor(Math.random() * this._tips.length);
+    this.$load.tip.textContent = this._tips[this._tipIdx];
     return L;
   }
 
@@ -297,10 +335,11 @@ export default class Hud {
       </div>
       <div class="q-desc"></div>
       <div class="apply-row"><span class="apply-note"></span><button type="button" class="btn-apply">Apply and reload</button></div>
-      <div class="row"><label for="ls-sens">Mouse sensitivity</label><div class="rng"><input id="ls-sens" type="range" min="0.25" max="3" step="0.05"><output class="val-sens"></output></div></div>
+      <div class="row"><label for="ls-sens">${this.touch ? 'Look sensitivity' : 'Mouse sensitivity'}</label><div class="rng"><input id="ls-sens" type="range" min="0.25" max="3" step="0.05"><output class="val-sens"></output></div></div>
       <div class="row"><label>Invert vertical look</label><button type="button" class="tog" role="switch" data-k="invertY"><i></i></button></div>
       <div class="row"><label for="ls-vol">Master volume</label><div class="rng"><input id="ls-vol" type="range" min="0" max="100" step="1"><output class="val-vol"></output></div></div>
-      <div class="row"><label>Subtitles</label><button type="button" class="tog" role="switch" data-k="subtitles"><i></i></button></div>`;
+      <div class="row"><label>Subtitles</label><button type="button" class="tog" role="switch" data-k="subtitles"><i></i></button></div>
+      <div class="row"><label>Show FPS</label><button type="button" class="tog" role="switch" data-k="showFps"><i></i></button></div>`;
     let pending = null;
     const applyRow = P.querySelector('.apply-row'), note = P.querySelector('.apply-note'), desc = P.querySelector('.q-desc');
     const describe = (k) => {
@@ -345,17 +384,67 @@ export default class Hud {
     this._syncSettingsUI = sync;
     sens.addEventListener('input', () => this._setSetting('sensitivity', +sens.value));
     vol.addEventListener('input', () => this._setSetting('volume', +vol.value / 100));
+    if (this.touch) { this._touchSlider(sens); this._touchSlider(vol); }
     P.querySelectorAll('.tog').forEach((t) => t.addEventListener('click', () => this._setSetting(t.dataset.k, !this.settings[t.dataset.k])));
     sync();
     return P;
   }
 
+  /** Touch: a native range input jumps to wherever a finger lands (and touch adjustment snaps nearby touches onto it),
+   *  so scrolling the settings panel nudged the sliders. Here the input only displays the value: a horizontal drag
+   *  anywhere on its row moves the value relative to where it was, a vertical drag scrolls the panel (touch-action:
+   *  pan-y, the browser cancels the pointer), and a tap changes nothing. */
+  _touchSlider(input) {
+    const box = input.closest('.rng') || input.parentElement;
+    if (!box) return;
+    input.tabIndex = -1;
+    let id = null, x0 = 0, y0 = 0, v0 = 0, drag = false;
+    box.addEventListener('pointerdown', (e) => {
+      if (id !== null || (e.pointerType === 'mouse' && e.button !== 0)) return;
+      id = e.pointerId; x0 = e.clientX; y0 = e.clientY; v0 = +input.value; drag = false;
+    });
+    box.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== id) return;
+      if (!drag) {
+        const dx = e.clientX - x0, dy = e.clientY - y0;
+        if (Math.abs(dx) < 8 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+        drag = true; x0 = e.clientX; box.classList.add('dragging');
+        try { box.setPointerCapture(id); } catch {}
+      }
+      const min = +input.min, max = +input.max, step = +input.step || 0.01;
+      const w = input.getBoundingClientRect().width || 120;
+      let v = v0 + ((e.clientX - x0) / w) * (max - min);
+      v = Math.max(min, Math.min(max, Math.round((v - min) / step) * step + min));
+      if (Math.abs(v - +input.value) > step * 0.5) { input.value = String(v); input.dispatchEvent(new Event('input', { bubbles: true })); }
+      if (e.cancelable) e.preventDefault();
+    });
+    const end = (e) => { if (e.pointerId !== id) return; id = null; drag = false; box.classList.remove('dragging'); };
+    box.addEventListener('pointerup', end);
+    box.addEventListener('pointercancel', end);
+  }
+
   _buildControls() {
     const P = el('section', 'panel controls');
+    if (this.touch) { P.innerHTML = '<h3>Controls</h3>' + this._touchControlsHTML(this._touchControls); return P; }
     P.innerHTML = '<h3>Controls</h3>' + CONTROLS.map(([grp, rows]) =>
       `<div class="c-grp"><div class="c-head">${grp}</div>${rows.map(([k, v]) =>
         `<div class="c-row"><span class="keys">${k.split(' / ').map((x) => x.split(' ').map((kk) => `<kbd>${esc(kk)}</kbd>`).join('')).join('<em>/</em>')}</span><span class="c-act">${esc(v)}</span></div>`).join('')}</div>`).join('');
     return P;
+  }
+  /** Touch controls help: each control as a rounded pill (like the on-screen buttons), with its action. */
+  _touchControlsHTML(groups) {
+    return (groups || []).map(([grp, rows]) =>
+      `<div class="c-grp"><div class="c-head">${esc(grp)}</div>${(rows || []).map(([k, v]) =>
+        `<div class="c-row"><span class="keys"><span class="tkey">${esc(k)}</span></span><span class="c-act">${esc(v)}</span></div>`).join('')}</div>`).join('');
+  }
+  /** Replace the touch controls help: [[group, [[control, action], ...]], ...] (the touch layer knows its buttons). */
+  setControlsHelp(groups) {
+    if (!Array.isArray(groups) || !groups.length) return;
+    this._touchControls = groups;
+    const P = this.panels?.controls;
+    if (!P || !this.touch) return;
+    for (const n of [...P.children]) if (!n.matches('h3, .p-back')) n.remove();
+    P.querySelector('h3').insertAdjacentHTML('afterend', this._touchControlsHTML(groups));
   }
 
   _buildCredits() {
@@ -409,6 +498,34 @@ export default class Hud {
     // click on the canvas while playing re-acquires pointer lock (Chrome refuses right after an exit)
     this._onCanvasClick = () => { if (this.started && !this.screen && !this._isLocked()) this.ctx.input?.requestLock?.(); };
     this.ctx.renderer?.domElement?.addEventListener('click', this._onCanvasClick);
+    this._watchOrientation();
+  }
+
+  /** Touch devices, portrait: the "Rotate your device" overlay (gate.js + style.css) covers everything; gameplay is
+   *  paused under it through the normal pause (so input, audio and the platform all follow), and resumed on rotating
+   *  back to landscape, but only if the overlay was what paused it (a pause the player opened stays open). */
+  _watchOrientation() {
+    if (!this.touch) return;
+    let mq = null;
+    try { mq = window.matchMedia('(orientation: portrait)'); } catch { return; }
+    if (!mq) return;
+    const check = () => {
+      const portrait = !!mq.matches;
+      this.rotateBlocked = portrait;
+      if (portrait) {
+        if (!this._rotHeld && this.started && !this.screen) {
+          this.pause();
+          this._rotHeld = this.screen === 'pause';
+        }
+      } else if (this._rotHeld) {
+        this._rotHeld = false;
+        if (this.screen === 'pause' && !this._openPanel) this.resume();
+      }
+    };
+    this._orientCheck = check;
+    this._mq = mq;
+    try { mq.addEventListener('change', check); } catch { try { mq.addListener(check); } catch {} }
+    check();
   }
 
   _isLocked() { try { return !!this.ctx.input?.locked; } catch { return false; } }
@@ -492,7 +609,7 @@ export default class Hud {
     if (this._loadGone || !this.$load) { clearInterval(this._tipTimer); return; }
     const tip = this.$load.tip;
     tip.classList.add('out');
-    setTimeout(() => { this._tipIdx = (this._tipIdx + 1) % TIPS.length; tip.textContent = TIPS[this._tipIdx]; tip.classList.remove('out'); }, 450);
+    setTimeout(() => { this._tipIdx = (this._tipIdx + 1) % this._tips.length; tip.textContent = this._tips[this._tipIdx]; tip.classList.remove('out'); }, 450);
   }
 
   _onBootDone() {
@@ -530,6 +647,7 @@ export default class Hud {
     this.showScreen(null);
     this._applySettings();
     if (this._objective) this._showObjective();
+    this._orientCheck?.(); // started while the device is in portrait (e.g. autostart): hold it under the overlay
   }
 
   _autoEnd(name, data, delay) {
@@ -591,6 +709,14 @@ export default class Hud {
     if (!host || !P) return;
     host.innerHTML = '';
     host.appendChild(P);
+    // touch: a panel taller than the screen scrolls inside; its bottom edge fades while there is more below
+    if (this.touch && !host._moreBound) {
+      host._moreBound = true;
+      const more = () => host.classList.toggle('more', host.scrollHeight - host.scrollTop - host.clientHeight > 2);
+      host.addEventListener('scroll', more, { passive: true });
+      window.addEventListener('resize', more);
+      host._more = more;
+    }
     this._syncSettingsUI?.();
     screen.querySelectorAll('.m-item').forEach((b) => b.classList.toggle('active', b === btn));
     host.classList.remove('on'); void host.offsetWidth; host.classList.add('on');
@@ -598,7 +724,10 @@ export default class Hud {
     screen.classList.add('panel-open');
     // keyboard users land inside the panel; the opener keeps its active marker
     const first = P.querySelector('.seg [aria-checked="true"]') || P.querySelector('button:not(.p-back), input, a[href]');
-    if (first) setTimeout(() => { if (this._openPanel === id) first.focus({ preventScroll: true }); }, 30);
+    host.scrollTop = 0;
+    host._more?.(); requestAnimationFrame(() => host._more?.());
+    if (this.touch) { /* no keyboard focus on touch (no focus ring on a tapped control) */ }
+    else if (first) setTimeout(() => { if (this._openPanel === id) first.focus({ preventScroll: true }); }, 30);
     else btn?.focus?.({ preventScroll: true });
   }
   _closePanel(screen) {
@@ -608,7 +737,8 @@ export default class Hud {
     screen?.querySelectorAll('.m-item').forEach((b) => b.classList.remove('active'));
     const btn = screen?.querySelector(`.m-item[data-id="${this._openPanel}"]`);
     this._openPanel = null; this._panelScreen = null;
-    btn?.focus({ preventScroll: true });
+    if (this.touch) { if (document.activeElement && screen?.contains(document.activeElement)) document.activeElement.blur(); }
+    else btn?.focus({ preventScroll: true });
   }
 
   _retry() {
@@ -644,11 +774,13 @@ export default class Hud {
     if (inp) { inp.sensitivity = BASE_SENS * (+s.sensitivity || 1); inp.invertY = !!s.invertY; }
     try { this.ctx.audio?.setMasterVolume?.(s.volume); } catch {}
     if (!s.subtitles) this.$?.subtitle?.classList.remove('on');
+    setFpsVisible(!!s.showFps); // on-screen FPS counter (src/ui/fps.js)
   }
 
   // ------------------------------------------------------------------------------------------ pause
   pause() {
     if (!this.started || this.screen) return;
+    this._rotHeld = false; // a pause opened any other way is the player's (or the game's) own
     this.showScreen('pause');
   }
   resume() {
@@ -695,10 +827,10 @@ export default class Hud {
     if (menuOpen && name !== 'title' && this._isLocked()) { this._selfUnlock = true; try { ctx.input.exitLock(); } catch {} }
     this.root?.classList.toggle('menu-open', menuOpen);
 
-    if (name) {
+    if (name && !this.touch) {
       const first = this.screens[name].querySelector('.m-item.primary') || this.screens[name].querySelector('button');
       setTimeout(() => { if (this.screen === name) first?.focus({ preventScroll: true }); }, name === 'title' ? 900 : 80);
-    } else if (document.activeElement && this.root?.contains(document.activeElement)) {
+    } else if (document.activeElement && this.root?.contains(document.activeElement)) { // (touch: no focus ring)
       document.activeElement.blur();
     }
     this._refreshVisibility();
@@ -720,8 +852,12 @@ export default class Hud {
       if (m) { key = m[1]; label = (text.slice(0, m.index) + ' ' + text.slice(m.index + m[0].length)).replace(/\s+/g, ' ').trim(); }
       const hm = key ? /^hold\s+/i.exec(label) : null;
       if (hm) { hold = true; label = label.slice(hm[0].length); }
-      $.keyCap.textContent = key || '';
-      $.keyCap.classList.toggle('wide', !!key && key.length > 2);
+      // touch: a fingertip glyph instead of the key cap (the key means nothing on a phone)
+      const tap = this.touch && !!key;
+      if (tap) { if (!$.keyCap.classList.contains('tap')) $.keyCap.innerHTML = TAP_SVG; }
+      else $.keyCap.textContent = key || '';
+      $.keyCap.classList.toggle('tap', tap);
+      $.keyCap.classList.toggle('wide', !tap && !!key && key.length > 2);
       $.promptLabel.textContent = label;
       $.prompt.classList.toggle('hint', !key);
       $.prompt.classList.toggle('hold', hold);
@@ -902,6 +1038,7 @@ export default class Hud {
     window.removeEventListener('keydown', this._onKey, true);
     window.removeEventListener('keyup', this._onKeyUp, true);
     document.removeEventListener('pointerlockchange', this._onLock);
+    try { this._mq?.removeEventListener('change', this._orientCheck); } catch {}
     this.ctx.renderer?.domElement?.removeEventListener('click', this._onCanvasClick);
     clearInterval(this._tipTimer); clearTimeout(this._objTimer); clearTimeout(this._subTimer); clearTimeout(this._autoEndT);
     this._loadGone = true;

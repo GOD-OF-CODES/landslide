@@ -81,12 +81,21 @@ export default class Audio {
     this._pour = null;
     this._stepSide = 1;
 
-    // gesture unlock (autostart path has no Start click)
+    // gesture unlock (autostart path has no Start click). (MOBILEPERF) Persistent, and on the events that really count
+    // as a user activation for audio: a touch pointerdown/touchstart does NOT (spec + iOS Safari: touchend / pointerup /
+    // click do), so the old once-only pointerdown listener spent itself on the first tap of a phone. Later gestures
+    // also resume a context the OS suspended (iOS reports 'interrupted' after an app switch, a call or Siri), unless
+    // the platform is holding it silent on purpose (ad, CrazyGames mute setting, hidden page: platform mute reasons).
     if (!this.muted) {
-      const onGesture = () => { this.unlock(); };
-      window.addEventListener('pointerdown', onGesture, { once: true, capture: true });
-      window.addEventListener('keydown', onGesture, { once: true, capture: true });
-      this._unsub.push(() => { window.removeEventListener('pointerdown', onGesture, { capture: true }); window.removeEventListener('keydown', onGesture, { capture: true }); });
+      const onGesture = () => {
+        const ac = this.ac;
+        if (ac && ac.state === 'running') return;
+        if (ac && window.__platform?._muteReasons?.size) return;
+        this.unlock();
+      };
+      const EVENTS = ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown'];
+      for (const ev of EVENTS) window.addEventListener(ev, onGesture, { capture: true, passive: true });
+      this._unsub.push(() => { for (const ev of EVENTS) window.removeEventListener(ev, onGesture, { capture: true }); });
     }
     this._listen();
   }
@@ -99,17 +108,29 @@ export default class Audio {
 
   unlock() {
     if (this.muted) return Promise.resolve(false);
-    if (this._unlocking) return this._unlocking;
+    if (this._unlocking) {
+      // a later gesture resumes a context that is suspended or interrupted (see constructor), also while the first
+      // unlock is still waiting on a resume() that had no user activation behind it
+      if (this.ac && this.ac.state !== 'running') {
+        let p = null;
+        try { p = this.ac.resume(); p?.catch?.(() => {}); } catch {}
+        if (this._acReady && p?.then) return p.then(() => this.ac?.state === 'running', () => false);
+      }
+      return this._unlocking;
+    }
     this._unlocking = (async () => {
       try {
         if (!this.ac) {
           const AC = window.AudioContext || window.webkitAudioContext;
           if (!AC) return false;
           this.ac = new AC({ latencyHint: 'interactive' });
+          // resume inside the gesture itself: iOS Safari only honours it before the awaits below
+          try { this.ac.resume?.()?.catch?.(() => {}); } catch {}
           this._buildGraph();
           this._startBanks();
           await this._initEngine();
         }
+        this._acReady = true;
         if (this.ac.state !== 'running') await this.ac.resume();
         return true;
       } catch (e) {
@@ -306,6 +327,8 @@ export default class Audio {
     this.cabinGain = ac.createGain(); this.cabinGain.gain.value = 0;
     this.cabinLp.connect(this.cabinGain); this.cabinGain.connect(this.int);
     try {
+      // AudioWorklet needs a secure context (https or localhost): e.g. a phone testing against a LAN dev server has none
+      if (!ac.audioWorklet) throw Object.assign(new Error('AudioWorklet unavailable (insecure context?)'), { quiet: true });
       await ac.audioWorklet.addModule(new URL('./engine.worklet.js', import.meta.url));
       const node = new AudioWorkletNode(ac, 'landslide-engine', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
       const split = ac.createChannelSplitter(2);
@@ -316,7 +339,7 @@ export default class Audio {
       this.engP = node.parameters;
       this.stats.engine = 'worklet';
     } catch (e) {
-      console.error('[audio] engine worklet unavailable, using oscillator fallback', e);
+      (e?.quiet ? console.warn : console.error)('[audio] engine worklet unavailable, using oscillator fallback', e?.message || e);
       // fallback: two detuned sawtooth oscillators at the firing frequency through a low-pass
       const o1 = ac.createOscillator(), o2 = ac.createOscillator(), lp = ac.createBiquadFilter(), g = ac.createGain();
       o1.type = 'sawtooth'; o2.type = 'square'; lp.type = 'lowpass'; lp.frequency.value = 500; g.gain.value = 0;
