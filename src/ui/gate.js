@@ -11,7 +11,7 @@
 // UI mode for every screen: `html.touch` is set here before any screen exists (style.css scopes every touch rule under
 // it, so desktop is untouched), the "Rotate your device" overlay is installed (CSS shows it in portrait), and iOS
 // pinch/double-tap zoom is blocked. The HUD re-syncs the mode with ctx.input.touch once the input exists.
-import { QUALITY_PRESETS } from '../core/config.js';
+import { QUALITY_PRESETS, QUALITY_TIERS, allowedQuality } from '../core/config.js';
 import * as CFG from '../core/config.js'; // namespace import: DEVICE may be absent (then the local fallback is used)
 
 const INFO = {
@@ -20,7 +20,7 @@ const INFO = {
   high: { title: 'High', blurb: 'Full-quality assets and effects. For Apple Silicon or a dedicated GPU.' },
   ultra: { title: 'Ultra', blurb: 'Everything at maximum, at native Retina resolution. For powerful GPUs.' },
 };
-const ORDER = ['low', 'medium', 'high', 'ultra'];
+const ORDER = ['low', 'medium', 'high', 'ultra'].filter((k) => QUALITY_TIERS.includes(k)); // tiers this build offers
 /** Download per preset in MB, measured on the production build: the asset files each preset requests at boot, each
  *  file counted once (QA: brown_mud_rocks_01 and car.glb are requested twice, the second time a 304 from the cache,
  *  which the earlier count included: High read 95). Code (JS, wasm, CSS) adds about 2.3 MB more on the wire.
@@ -125,7 +125,8 @@ const TOUCH_BLURB = {
 if (touchUI) for (const k of ORDER) INFO[k].blurb = TOUCH_BLURB[k];
 
 /** Rough device hint from the WebGL renderer string. It's only a suggestion; the player decides. */
-export function recommendQuality() {
+export function recommendQuality() { return allowedQuality(recommendRaw()) || 'low'; }
+function recommendRaw() {
   try {
     const gl = document.createElement('canvas').getContext('webgl2');
     if (!gl) return 'low';
@@ -154,7 +155,7 @@ export function showQualityGate(initial = 'low') {
   </div>
   <div class="qg-foot" role="dialog" aria-label="Choose graphics quality">
     <div class="load-row"><span class="load-label" id="qg-label">Graphics quality</span><span class="qg-sugg">Suggested for this device: <b>${INFO[rec].title}</b></span></div>
-    <div class="qg-seg" role="radiogroup" aria-labelledby="qg-label">
+    <div class="qg-seg" style="--qg-n:${ORDER.length}" role="radiogroup" aria-labelledby="qg-label">
       ${ORDER.map((k) => `<button type="button" role="radio" data-q="${k}" aria-checked="false" tabindex="-1">
         ${k === rec ? '<span class="qg-rec">Suggested</span>' : ''}<span class="qg-name">${INFO[k].title}</span><span class="qg-mb">${mb(k)} MB</span></button>`).join('')}
     </div>
@@ -208,10 +209,10 @@ export function showQualityGate(initial = 'low') {
     };
     const onKey = (e) => {
       const i = ORDER.indexOf(sel);
-      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { sel = ORDER[Math.min(3, i + 1)]; paint(true); e.preventDefault(); }
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { sel = ORDER[Math.min(ORDER.length - 1, i + 1)]; paint(true); e.preventDefault(); }
       else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { sel = ORDER[Math.max(0, i - 1)]; paint(true); e.preventDefault(); }
       else if (e.key === 'Home') { sel = ORDER[0]; paint(true); e.preventDefault(); }
-      else if (e.key === 'End') { sel = ORDER[3]; paint(true); e.preventDefault(); }
+      else if (e.key === 'End') { sel = ORDER[ORDER.length - 1]; paint(true); e.preventDefault(); }
       else if (e.key === 'Enter' || e.key === 'NumpadEnter') { e.preventDefault(); done(); }
       else if (e.key === ' ' && document.activeElement?.classList?.contains('qg-go')) { e.preventDefault(); done(); }
     };

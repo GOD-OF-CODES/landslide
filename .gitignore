@@ -6,3 +6,6 @@ raw_assets
 .DS_Store
 tools/blender/__pycache__
 .env*
+dist-crazygames
+*.zip
+!.env.crazygames
