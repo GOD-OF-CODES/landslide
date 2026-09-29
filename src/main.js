@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { config } from './core/config.js';
+import { config, DEVICE } from './core/config.js';
 import { Events } from './core/events.js';
 import { Input } from './core/input.js';
 import { Assets, setVariantTier, BASE } from './core/assets.js';
@@ -65,18 +65,33 @@ async function boot() {
   // start fetching every system module now (dynamic imports are cached, init still runs in order below)
   for (const [, loader] of SYSTEMS) loader().catch(() => {});
 
-  const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false, depth: true });
+  // (MOBILEPERF) WebGL2 is required (three r186). Say so plainly instead of failing somewhere inside the renderer.
+  if (typeof WebGL2RenderingContext === 'undefined') {
+    throw new FriendlyError('LANDSLIDE needs WebGL 2, which this browser does not support. Please update your browser '
+      + '(Safari 15 or later on iPhone and iPad, or a recent Chrome, Firefox or Edge) and open the game again.');
+  }
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false, depth: true });
+  } catch (e) {
+    console.warn('[boot] WebGL renderer', e);
+    throw new FriendlyError('Your browser could not start 3D graphics (WebGL 2). Close other tabs or apps, check that '
+      + 'hardware acceleration is turned on in the browser settings, and reload.');
+  }
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.NoToneMapping; // tone mapping happens in render/post.js
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap; // r18x: PCFSoft removed; PCF is filtered (use light.shadow.radius)
   const q = config.quality;
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, q.maxDpr) * q.pixelRatio);
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  // render resolution: CSS size x min(devicePixelRatio, maxDpr) x the preset's pixelRatio (x the adaptive scale below)
+  const presetRatio = () => Math.min(window.devicePixelRatio || 1, q.maxDpr) * q.pixelRatio;
+  const vp0 = viewportSize();
+  renderer.setPixelRatio(presetRatio());
+  renderer.setSize(vp0.w, vp0.h);
   container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(config.camera.fov, window.innerWidth / window.innerHeight, config.camera.near, config.camera.far);
+  const camera = new THREE.PerspectiveCamera(config.camera.fov, vp0.w / vp0.h, config.camera.near, config.camera.far);
   camera.position.set(0, 50, 0);
   scene.add(camera); // so camera-attached objects (rain, viewmodel) render
 
@@ -94,6 +109,13 @@ async function boot() {
   };
   ctx.physics.ctx = ctx;
   ctx.debug = new Debug(ctx);
+  ctx.device = DEVICE;
+  const gl = watchContextLoss(renderer, ctx);
+  // (MOBILEPERF) a hidden tab/app: silence the audio (through the platform's mute reasons, so it reconciles with ads
+  // and the CrazyGames mute setting); the frame loop below skips all work while hidden.
+  const onVisibility = () => { try { platform._setMute?.('hidden', !!document.hidden); } catch {} };
+  document.addEventListener('visibilitychange', onVisibility);
+  onVisibility();
   if (!flags.only) prefetch(ctx.assets);
 
   // Core data first
@@ -122,13 +144,36 @@ async function boot() {
   }
 
   const fixedCam = ctx.debug.applyFixedCamera(camera);
-  const onResize = () => {
-    const w = window.innerWidth, h = window.innerHeight;
+  // Resize. applySize() always resizes (adaptive resolution calls it after changing the pixel ratio); onResize() is the
+  // event handler: it re-reads the devicePixelRatio (it changes when a window moves to another display, with browser
+  // zoom, and on some phones on rotation) and only does work when the size or the ratio really changed. On touch
+  // devices the size comes from visualViewport (iOS Safari: the visible area, not the 100vh layout box) and is checked
+  // again shortly after each event, because iOS reports stale sizes at the moment it fires resize/orientationchange.
+  let lastW = vp0.w, lastH = vp0.h, lastRatio = presetRatio();
+  let ares = null;
+  const applySize = () => {
+    const { w, h } = viewportSize();
+    lastW = w; lastH = h;
     renderer.setSize(w, h);
     camera.aspect = w / h; camera.updateProjectionMatrix();
     ctx.events.emit('resize', { width: w, height: h });
   };
-  window.addEventListener('resize', onResize);
+  const onResize = () => {
+    const { w, h } = viewportSize();
+    const ratio = presetRatio();
+    if (w === lastW && h === lastH && ratio === lastRatio) return;
+    if (ratio !== lastRatio) { lastRatio = ratio; renderer.setPixelRatio(ratio * (ares ? ares.scale : 1)); }
+    applySize();
+  };
+  const onResizeEvent = () => {
+    onResize();
+    if (DEVICE.touch) { setTimeout(onResize, 250); setTimeout(onResize, 700); }
+  };
+  window.addEventListener('resize', onResizeEvent);
+  if (DEVICE.touch) {
+    window.addEventListener('orientationchange', onResizeEvent);
+    window.visualViewport?.addEventListener?.('resize', onResizeEvent);
+  }
 
   // Warm up: compile shaders before first visible frame. compileAsync alone only builds the main-pass programs of
   // objects that are visible right now, and no shadow-map depth programs at all: every caster type (instanced,
@@ -165,10 +210,11 @@ async function boot() {
     }
   };
 
-  // Adaptive resolution (medium/low only; ultra/high always render at their full preset resolution).
-  // Lowers the pixel ratio in 10% steps when the frame rate stays under ~40 fps, and restores it when there is headroom.
-  const baseRatio = renderer.getPixelRatio();
-  const ares = { on: !!config.quality.adaptiveRes && !flags.fixedCam, scale: 1, t: 0, n: 0, sum: 0 };
+  // Adaptive resolution (desktop: medium/low only; ultra/high always render at their full preset resolution; mobile:
+  // every preset, see config.js MOBILE_ADJUST). Lowers the pixel ratio in 10% steps when the frame rate stays under
+  // ~40 fps (mobile ~27 fps), and restores it when there is headroom. The floor is adaptiveMin (desktop 0.55).
+  const aMin = q.adaptiveMin ?? 0.55, aDown = q.adaptiveDown ?? 1 / 40, aUp = q.adaptiveUp ?? 1 / 57;
+  ares = { on: !!config.quality.adaptiveRes && !flags.fixedCam, scale: 1, t: 0, n: 0, sum: 0, min: aMin };
   ctx.adaptiveRes = ares;
   function adaptResolution(rawDt) {
     if (!ares.on || ctx.paused || document.hidden) return;
@@ -177,17 +223,25 @@ async function boot() {
     const avg = ares.sum / ares.n;
     ares.t = ares.sum = ares.n = 0;
     let next = ares.scale;
-    if (avg > 1 / 40) next = Math.max(0.55, ares.scale * 0.9);
-    else if (avg < 1 / 57) next = Math.min(1, ares.scale * 1.06);
+    if (avg > aDown) next = Math.max(aMin, ares.scale * 0.9);
+    else if (avg < aUp) next = Math.min(1, ares.scale * 1.06);
     if (Math.abs(next - ares.scale) > 0.005) {
       ares.scale = next;
-      renderer.setPixelRatio(baseRatio * next);
-      onResize();
+      renderer.setPixelRatio(lastRatio * next);
+      applySize();
     }
   }
 
   let readyFrames = 0;
   function frame() {
+    // (MOBILEPERF) no work while the page is hidden (browsers usually stop rAF then anyway; some iframes only throttle
+    // it) or while the WebGL context is lost (the "tap to reload" overlay is up; see watchContextLoss)
+    if (document.hidden || gl.lost) {
+      if (gl.lost) platform.update(ctx);
+      ctx.input.endFrame();
+      requestAnimationFrame(frame);
+      return;
+    }
     timer.update();
     const rawDt = Math.min(timer.getDelta(), 0.1);
     const dt = ctx.paused ? 0 : rawDt * ctx.time.scale;
@@ -224,6 +278,61 @@ async function boot() {
   requestAnimationFrame(frame);
 }
 
+/** Canvas size in CSS pixels. Touch devices: the visual viewport (the area really visible on iOS Safari, where the
+ *  layout viewport / 100vh can extend under the toolbars); pinch-zoomed (scale > 1) or missing: the window. */
+function viewportSize() {
+  const vv = DEVICE.touch ? window.visualViewport : null;
+  if (vv && vv.scale <= 1.01 && vv.width > 0 && vv.height > 0) return { w: Math.floor(vv.width), h: Math.floor(vv.height) };
+  return { w: window.innerWidth, h: window.innerHeight };
+}
+
+/** An error whose message is written for the player (shown by showFatal). */
+class FriendlyError extends Error {}
+
+/**
+ * WebGL context loss (MOBILEPERF). Mobile browsers drop the context under memory pressure or after the app was in the
+ * background (iOS Safari especially), and a GPU reset can do it on desktop. Without handling, the last frame just
+ * freezes. Instead: the game is held (paused, so the platform reports gameplayStop and the loop skips all work) and a
+ * "Tap to reload" screen comes up. It stays even if the context is restored: render-target contents (the PMREM sky
+ * lighting, the reflection history, baked arrays) are gone, so a reload (quality kept, no quality screen) is the
+ * reliable way back. Returns {lost} (read every frame).
+ */
+function watchContextLoss(renderer, ctx) {
+  const state = { lost: false, restored: false };
+  const canvas = renderer.domElement;
+  let el = null;
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault(); // allows the browser to restore it (and stops some browsers from showing their own error)
+    if (state.lost) return;
+    state.lost = true;
+    console.warn('[boot] WebGL context lost');
+    ctx.paused = true;
+    try { if (ctx.input) { ctx.input.enabled = false; ctx.input.exitLock?.(); } } catch {}
+    try { platform._setMute?.('glLost', true); } catch {}
+    try { ctx.events?.emit?.('gl:lost', {}); } catch {}
+    if (el) return;
+    el = document.createElement('div');
+    el.id = 'gl-lost';
+    el.setAttribute('role', 'alertdialog');
+    el.style.cssText = 'position:fixed;inset:0;z-index:99998;display:flex;align-items:center;justify-content:center;'
+      + 'background:rgba(11,13,14,.94);color:#eceee9;font:15px/1.5 system-ui,sans-serif;padding:24px;cursor:pointer;'
+      + 'touch-action:manipulation;-webkit-tap-highlight-color:transparent;text-align:center';
+    const verb = DEVICE.touch ? 'Tap' : 'Click';
+    el.innerHTML = `<div style="max-width:520px">
+      <div style="font:500 28px/1 'Barlow Condensed','Arial Narrow',sans-serif;letter-spacing:.3em;margin-bottom:18px">LANDSLIDE</div>
+      <p style="color:rgba(236,238,233,.75);margin:0 0 22px">The graphics were reset by the device (this can happen when the game was
+      in the background or memory ran low). Your quality setting is kept.</p>
+      <button type="button" style="all:unset;cursor:pointer;padding:14px 30px;background:#eaa53f;color:#0b0d0e;font-weight:600;
+      letter-spacing:.18em;text-transform:uppercase;border-radius:4px">${verb} to reload</button></div>`;
+    const reload = (ev) => { ev?.preventDefault?.(); try { sessionStorage.setItem('landslide.gateDone', '1'); } catch {} location.reload(); };
+    el.addEventListener('click', reload);
+    el.addEventListener('touchend', reload);
+    document.body.appendChild(el);
+  }, false);
+  canvas.addEventListener('webglcontextrestored', () => { state.restored = true; console.warn('[boot] WebGL context restored; reload to continue'); }, false);
+  return state;
+}
+
 /** Temporarily makes every mesh renderable (visible incl. ancestors, not frustum-culled, instance count >= 1).
  *  Returns a function that restores the previous state. Used only for the boot shader warm-up. */
 function forceRenderable(scene) {
@@ -242,6 +351,7 @@ function forceRenderable(scene) {
 /** Entry point, called by src/boot.js once the quality is chosen. */
 export function start() {
   return boot().catch((e) => {
+    if (e instanceof FriendlyError) { console.warn('[boot]', e.message); showFatal(e); return; }
     console.error('[boot] fatal', e);
     if (isStaleChunkError(e) && recoverFromStaleBuild(e)) return;
     showFatal(e);

@@ -682,7 +682,10 @@ export default class Post {
 
     // ---- ambient occlusion ----------------------------------------------------------------------------------
     // (N8AO's half-resolution mode downsamples depth into an R32F target: it needs full-float colour buffers)
-    if (q.ao && q.ao !== 'off' && !dbg.has('noao') && (fl.full || !(AO_MODES[q.ao] || AO_MODES.medium)[1])) {
+    // (MOBILEPERF) mobile: also require linear filtering of float textures for the half-res path (iOS/Mali drivers often
+    // lack OES_texture_float_linear; the preset then simply renders without AO)
+    const aoFloat = fl.full && (!q.mobile || renderer.extensions.has('OES_texture_float_linear'));
+    if (q.ao && q.ao !== 'off' && !dbg.has('noao') && (aoFloat || !(AO_MODES[q.ao] || AO_MODES.medium)[1])) {
       try {
         const ao = new N8AOPostPass(scene, camera, size.x, size.y);
         ao.autoDetectTransparency = false;
@@ -703,7 +706,8 @@ export default class Post {
     }
 
     // ---- volumetric mist (ground wisps, valley cloud sea, cloud banks on the slopes) ----------------------------
-    const mistScale = MIST_SCALE[q.key] !== undefined ? MIST_SCALE[q.key] : 0.5;
+    let mistScale = MIST_SCALE[q.key] !== undefined ? MIST_SCALE[q.key] : 0.5;
+    if (q.mobile && mistScale) mistScale *= 0.75;   // (MOBILEPERF) ray-marched mist at fewer pixels on phones/tablets
     if (mistScale && !dbg.has('nomist')) {
       try {
         this.passes.mist = new MistPass(this.ctx, mistScale);

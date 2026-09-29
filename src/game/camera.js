@@ -353,7 +353,7 @@ export default class CameraRig {
     const ctrl = this.ctx.control === 'car';
     const sens = input?.sensitivity ?? 0.0022;
     const mdx = ctrl ? (input?.dx || 0) : 0, mdy = ctrl ? (input?.dy || 0) : 0;
-    if (mdx || mdy) this._mouseIdle = 0; else this._mouseIdle += dt;
+    if (mdx || mdy || (ctrl && input?.lookHeld)) this._mouseIdle = 0; else this._mouseIdle += dt; // lookHeld: a finger resting on the touch look area
     this.lookYaw = clamp(this.lookYaw - mdx * sens, -2.1, 2.1);
     this.lookPitch = clamp(this.lookPitch - mdy * sens * (input?.invertY ? -1 : 1), -0.95, 0.75);
     const v = Math.abs(car.speed || 0);
@@ -389,7 +389,7 @@ export default class CameraRig {
     const ctrl = ctx.control === 'car';
     const sens = input?.sensitivity ?? 0.0022;
     const mdx = ctrl ? (input?.dx || 0) : 0, mdy = ctrl ? (input?.dy || 0) : 0;
-    if (mdx || mdy) this._mouseIdle = 0; else this._mouseIdle += dt;
+    if (mdx || mdy || (ctrl && input?.lookHeld)) this._mouseIdle = 0; else this._mouseIdle += dt; // lookHeld: a finger resting on the touch look area
     this.orbitYaw = wrapAngle(this.orbitYaw - mdx * sens * 1.2);
     this.orbitPitch = clamp(this.orbitPitch - mdy * sens, -0.25, 0.9);
     const v = car.speed || 0;

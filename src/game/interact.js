@@ -21,6 +21,7 @@
 //   interact.current            // id of the targeted entry or null
 //   interact.progress           // 0..1 hold progress
 //   interact.lock(seconds)      // suppress interactions briefly (animations, transitions)
+//   interact.prompt             // {text, progress}: the current prompt (touch: mirrored on the Interact button)
 //
 // It is the ONLY system calling hud.setPrompt (so prompts never flicker between owners).
 import * as THREE from 'three';
@@ -41,6 +42,7 @@ export default class Interact {
     this._lastProg = null;
     this._holding = null;
     this._dwell = 0; this._dwellId = null;
+    this.prompt = { text: null, progress: null }; // touch hook: the current prompt (see _setPrompt)
   }
 
   register(e) {
@@ -211,10 +213,15 @@ export default class Interact {
   }
 
   _setPrompt(text, progress) {
+    // touch hook: src/ui/touch.js mirrors this on its Interact button (label, hold ring)
+    this.prompt.text = text; this.prompt.progress = progress;
     const q = progress === null ? null : Math.round(progress * 100) / 100;
     if (text === this._lastPrompt && q === this._lastProg) return;
     this._lastPrompt = text; this._lastProg = q;
-    try { this.ctx.hud?.setPrompt?.(text, progress); } catch (err) { console.warn('[interact] hud.setPrompt', err); }
+    // touch: an actionable "[E] ..." prompt lives on the Interact button (a key cap means nothing on a phone); the HUD
+    // keeps showing hints (no key), which have no button
+    const shown = text && this.ctx.input?.touch && /\[[^\]]{1,8}\]/.test(text) ? null : text;
+    try { this.ctx.hud?.setPrompt?.(shown, shown ? progress : null); } catch (err) { console.warn('[interact] hud.setPrompt', err); }
   }
 
   /** Force the prompt to refresh (e.g. after the HUD rebuilt its DOM). */
