@@ -76,7 +76,7 @@ const CREDITS_HTML = `
 
 const CONTROLS = [
   ['On foot', [['W A S D', 'Move'], ['Mouse', 'Look'], ['Shift', 'Sprint'], ['Space', 'Jump'], ['E', 'Interact / hold to use']]],
-  ['Driving', [['W / S', 'Throttle / brake, reverse'], ['A / D', 'Steer'], ['Space', 'Handbrake'], ['C', 'Cockpit / chase camera'], ['E', 'Get in / out']]],
+  ['Driving', [['W / S', 'Throttle (starts the engine) / brake, reverse'], ['A / D', 'Steer'], ['Space', 'Handbrake'], ['C', 'Cockpit / chase camera'], ['E', 'Get in / out']]],
   ['General', [['Tab', 'Show objective'], ['Esc', 'Pause']]],
 ];
 
@@ -85,8 +85,8 @@ const CONTROLS = [
 const CONTROLS_TOUCH = [
   ['On foot', [['Left side', 'Move (push to the edge to sprint)'], ['Right side', 'Drag to look around'], ['Sprint', 'Sprint on / off'],
     ['Jump', 'Jump'], ['Interact', 'Use / hold to chop, pour, lay planks']]],
-  ['Driving', [['Left side', 'Slide to steer'], ['Gas', 'Throttle'], ['Brake', 'Brake, hold to reverse'], ['Handbrake', 'Handbrake'],
-    ['Camera', 'Cockpit / chase camera'], ['Interact', 'Get in / out, start the engine']]],
+  ['Driving', [['Left side', 'Slide to steer'], ['Gas', 'Throttle (starts the engine)'], ['Brake', 'Brake, hold to reverse'], ['Handbrake', 'Handbrake'],
+    ['Camera', 'Cockpit / chase camera'], ['Interact', 'Get in / out']]],
   ['General', [['Pause', 'Pause (top right)'], ['Right side', 'Drag to look around']]],
 ];
 

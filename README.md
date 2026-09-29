@@ -42,7 +42,7 @@ npm run preview      # serves dist/ at http://localhost:4173
 | Mouse | look | A / D | steer |
 | Shift | sprint | Space | handbrake |
 | Space | jump | C | cockpit / chase camera |
-| E | interact (hold to chop, pour, lay planks) | E | get in / out, start the engine |
+| E | interact (hold to chop, pour, lay planks) | E | get in / out (any time the car is stopped); W starts the engine |
 | Tab | show the current objective | Esc | pause (settings, controls, retry) |
 
 ## Quality settings
@@ -151,7 +151,7 @@ portrait and pauses the game). Touch mode is detected automatically; `?touch=1` 
 - **On foot:** a floating move stick in the left part of the screen (push it all the way to sprint), drag on the right to
   look, plus **Interact** (appears with the prompt; hold it to chop, refuel or lay the planks), **Jump** and **Sprint**.
 - **In the car:** a **Steer** slider on the left, **Gas** and **Brake / Reverse** pedals, handbrake, camera and
-  **Get out / Get in** on the right.
+  **Get out / Get in** on the right. Pressing **Gas** with the engine off turns the key.
 - **Everywhere:** a **Pause** button (top right). Move, look and a button all work at the same time (multi-touch).
 - **Layout:** every screen (quality choice, loading, title, pause, settings, death, win) fits small landscape phones,
   respects notches/safe areas, and never zooms or scrolls the page.
