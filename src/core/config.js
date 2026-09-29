@@ -108,19 +108,32 @@ const MOBILE_ADAPTIVE = { adaptiveDown: 1 / 27, adaptiveUp: 1 / 45 };
 export const EFFECTIVE_PRESETS = Object.fromEntries(Object.entries(QUALITY_PRESETS).map(([k, p]) => [k,
   DEVICE.mobile ? Object.freeze({ ...p, ...MOBILE_ADAPTIVE, ...MOBILE_ADJUST[k], mobile: true }) : p]));
 
+// Quality tiers offered by this build. The CrazyGames build (`npm run build:crazygames`, i.e. vite --mode crazygames with
+// .env.crazygames) sets VITE_QUALITY_TIERS=low,medium so High/Ultra don't exist there; the default build offers all four.
+const TIER_ORDER = ['low', 'medium', 'high', 'ultra'];
+export const QUALITY_TIERS = String(import.meta.env?.VITE_QUALITY_TIERS || TIER_ORDER.join(','))
+  .split(',').map((k) => k.trim()).filter((k) => QUALITY_PRESETS[k]);
+/** Maps any requested tier to one this build offers (a missing higher tier falls back to the best available one). */
+export function allowedQuality(q) {
+  if (!q || !QUALITY_PRESETS[q]) return null;
+  if (QUALITY_TIERS.includes(q)) return q;
+  for (let i = TIER_ORDER.indexOf(q); i >= 0; i--) if (QUALITY_TIERS.includes(TIER_ORDER[i])) return TIER_ORDER[i];
+  return QUALITY_TIERS[0] || 'low';
+}
+
 export function storedQuality() {
-  try { const q = localStorage.getItem('landslide.quality'); return QUALITY_PRESETS[q] ? q : null; } catch { return null; }
+  try { return allowedQuality(localStorage.getItem('landslide.quality')); } catch { return null; }
 }
 function pickQuality() {
-  const q = PARAMS.get('quality') || storedQuality();
-  return QUALITY_PRESETS[q] ? q : 'low';
+  return allowedQuality(PARAMS.get('quality')) || storedQuality() || 'low';
 }
 
 export const config = {
   qualityKey: pickQuality(),
   get quality() { return { key: this.qualityKey, ...EFFECTIVE_PRESETS[this.qualityKey] }; },
   setQuality(key) {
-    if (!QUALITY_PRESETS[key]) return;
+    key = allowedQuality(key);
+    if (!key) return;
     this.qualityKey = key;
     try { localStorage.setItem('landslide.quality', key); } catch {}
   },

@@ -14,12 +14,13 @@
 import { ICONS, ITEM_NAMES } from './icons.js';
 import { Cluster } from './gauges.js';
 import { DOWNLOAD_MB, QUALITY_INFO, isTouchUI, setTouchUI } from './gate.js';
+import { QUALITY_TIERS } from '../core/config.js';
 import { setFpsVisible } from './fps.js';
 
 const SETTINGS_KEY = 'landslide.settings';
 const DEFAULTS = { sensitivity: 1, invertY: false, volume: 0.8, subtitles: true, showFps: false };
 const BASE_SENS = 0.0022;
-const QUALITY_KEYS = ['low', 'medium', 'high', 'ultra'];
+const QUALITY_KEYS = ['low', 'medium', 'high', 'ultra'].filter((k) => QUALITY_TIERS.includes(k)); // tiers this build offers
 
 const TIPS = [
   'The debris flow does not stop. Every second you stand still, it gets closer.',
